@@ -53,7 +53,7 @@ class TestErrorHandling:
 
         def process_none(data: list[str]) -> list[str]:
             items = list(data)
-            return ["processed"] if not items else items
+            return items if items else ["processed"]
 
         slonk = Slonk() | return_empty | process_none
         result = list(run_pipeline(slonk, ["input"]))

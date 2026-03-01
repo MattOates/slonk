@@ -11,7 +11,7 @@ SQLAlchemy models, or custom handler objects.
 - **Pipe operator composition** — chain stages naturally with `|`.
 - **Automatic handler inference** — strings become path or shell handlers,
   callables are wrapped based on their signature, SQLAlchemy models become
-  database sources.
+  database sources, transforms, or sinks depending on position.
 - **Parallel execution** — stages run concurrently in threads connected by
   bounded queues with automatic backpressure (default mode).
 - **Free-threaded Python support** — detected at runtime; uses threads
@@ -88,6 +88,48 @@ pipeline = (
     Slonk()
     | (lambda: ["line 1", "line 2"])
     | "./output.txt"  # PathHandler: write + passthrough
+)
+```
+
+Cloud and remote paths are supported via
+[universal-pathlib](https://github.com/fsspec/universal_pathlib):
+
+```python
+# Read from S3, filter, write to GCS
+pipeline = (
+    Slonk()
+    | "s3://input-bucket/events.csv"
+    | (lambda rows: [r for r in rows if "ERROR" in r])
+    | "gs://output-bucket/errors.csv"
+)
+```
+
+### SQLAlchemy integration
+
+Pipe SQLAlchemy models directly -- the handler adapts to its position
+as Source, Transform, or Sink:
+
+```python
+from sqlalchemy import create_engine, Column, String
+from sqlalchemy.orm import DeclarativeBase, sessionmaker
+
+class Base(DeclarativeBase):
+    pass
+
+class Record(Base):
+    __tablename__ = "records"
+    id = Column(String, primary_key=True)
+    data = Column(String)
+
+engine = create_engine("sqlite:///data.db")
+Session = sessionmaker(bind=engine)
+
+# Read -> transform -> write back
+pipeline = (
+    Slonk(session_factory=Session)
+    | Record                     # Source: read all rows
+    | (lambda rows: [r.upper() for r in rows])
+    | Record                     # Sink: bulk-write transformed rows
 )
 ```
 

@@ -228,11 +228,22 @@ class ShellCommandHandler(SlonkBase):
 
 
 class SQLAlchemyHandler(SlonkBase):
-    """Queries all rows from a SQLAlchemy model and formats them as strings.
+    """Read, upsert, or bulk-write rows for a SQLAlchemy model.
 
-    Implements :class:`~slonk.roles.Source` — uses ``yield_per()`` to fetch
-    rows in chunks, yielding formatted strings one at a time for natural
-    streaming.
+    Implements all three roles:
+
+    * :class:`~slonk.roles.Source` — query all rows, yielding
+      ``"<id>\\t<data>"`` strings via chunked ``yield_per()`` fetching.
+    * :class:`~slonk.roles.Transform` — upsert each incoming
+      ``"<id>\\t<data>"`` row into the database using
+      :meth:`~sqlalchemy.orm.Session.merge`, then yield the item
+      unchanged (write + passthrough, like :class:`PathHandler`).
+    * :class:`~slonk.roles.Sink` — bulk-write incoming rows using
+      :meth:`~sqlalchemy.orm.Session.merge` with periodic flushes,
+      committing once at the end.  Returns ``None``.
+
+    The tab-separated format (``"<id>\\t<data>"``) is used as the
+    interchange format between pipeline stages.
 
     Args:
         model: A SQLAlchemy declarative model class.
@@ -241,12 +252,34 @@ class SQLAlchemyHandler(SlonkBase):
     """
 
     _YIELD_PER_CHUNK = 100
+    _BULK_FLUSH_EVERY = 500
 
     def __init__(
         self, model: type[DeclarativeBase], session_factory: sessionmaker[Session]
     ) -> None:
         self.model = model
         self.session_factory = session_factory
+
+    # -- helpers -----------------------------------------------------------
+
+    def _parse_record(self, item: str) -> DeclarativeBase:
+        """Parse a ``"<id>\\t<data>"`` string into a model instance.
+
+        Args:
+            item: Tab-separated id and data string.
+
+        Returns:
+            A new model instance with the parsed fields.
+
+        Raises:
+            ValueError: If *item* does not contain exactly one tab.
+        """
+        parts = item.split("\t", 1)
+        if len(parts) != 2:
+            msg = f"Expected '<id>\\t<data>' format, got: {item!r}"
+            raise ValueError(msg)
+        record_id, data = parts
+        return self.model(id=record_id, data=data)  # type: ignore[call-arg]
 
     # -- Source ------------------------------------------------------------
 
@@ -263,6 +296,53 @@ class SQLAlchemyHandler(SlonkBase):
             stmt = select(self.model)
             for record in session.execute(stmt).yield_per(self._YIELD_PER_CHUNK).scalars():
                 yield f"{record.id}\t{record.data}"  # type: ignore[attr-defined]
+        finally:
+            session.close()
+
+    # -- Transform ---------------------------------------------------------
+
+    def process_transform(self, input_data: Iterable[str]) -> Iterable[str]:
+        """Upsert each incoming row and pass data through.
+
+        Each item is parsed back into a model instance and merged
+        (upserted) into the database.  The original string is yielded
+        unchanged so downstream stages see every item.
+
+        Args:
+            input_data: ``"<id>\\t<data>"`` formatted strings.
+
+        Yields:
+            Each item unchanged after upserting.
+        """
+        session = self.session_factory()
+        try:
+            for item in input_data:
+                record = self._parse_record(item)
+                session.merge(record)
+                session.commit()
+                yield item
+        finally:
+            session.close()
+
+    # -- Sink --------------------------------------------------------------
+
+    def process_sink(self, input_data: Iterable[str]) -> None:
+        """Bulk-write incoming rows as efficiently as possible.
+
+        Rows are merged in batches of :attr:`_BULK_FLUSH_EVERY` with a
+        single commit at the end for maximum throughput.
+
+        Args:
+            input_data: ``"<id>\\t<data>"`` formatted strings.
+        """
+        session = self.session_factory()
+        try:
+            for count, item in enumerate(input_data, 1):
+                record = self._parse_record(item)
+                session.merge(record)
+                if count % self._BULK_FLUSH_EVERY == 0:
+                    session.flush()
+            session.commit()
         finally:
             session.close()
 

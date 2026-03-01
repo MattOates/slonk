@@ -68,6 +68,63 @@ pipeline = (
 # Writes to output.txt and passes data through
 ```
 
+Cloud and remote paths are supported via
+[universal-pathlib](https://github.com/fsspec/universal_pathlib):
+
+```python
+# Read from S3
+pipeline = Slonk() | "s3://my-bucket/input.csv"
+
+# Write to GCS and pass through
+pipeline = (
+    Slonk()
+    | (lambda: ["row1", "row2"])
+    | "gs://my-bucket/output.csv"
+)
+```
+
+## SQLAlchemy models
+
+Pipe a SQLAlchemy model directly into a pipeline.  The handler
+automatically adapts to its position -- as a **Source** (first stage),
+**Transform** (middle, upserts + passthrough), or **Sink** (last stage,
+bulk write):
+
+```python
+from sqlalchemy import create_engine, Column, String
+from sqlalchemy.orm import DeclarativeBase, sessionmaker
+
+class Base(DeclarativeBase):
+    pass
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(String, primary_key=True)
+    data = Column(String)
+
+engine = create_engine("sqlite:///app.db")
+Session = sessionmaker(bind=engine)
+
+# Read all rows (Source)
+pipeline = Slonk(session_factory=Session) | User
+rows = list(pipeline.run())  # ["1\tAlice", "2\tBob", ...]
+
+# Transform: upsert rows into the DB and pass through
+pipeline = (
+    Slonk(session_factory=Session)
+    | (lambda: ["3\tCharlie", "4\tDiana"])
+    | User        # upserts each row, passes data through
+    | "grep Diana"
+)
+
+# Sink: bulk-write rows (last stage, returns empty)
+pipeline = (
+    Slonk(session_factory=Session)
+    | (lambda: ["5\tEve", "6\tFrank"])
+    | User        # bulk-writes, returns nothing
+)
+```
+
 ## Sequential mode
 
 By default pipelines run in parallel (each stage in its own thread).
@@ -103,3 +160,4 @@ print(f"Pipeline took {tm.pipeline_duration:.4f}s")
 - [Middleware](../guide/middleware.md) -- observability hooks
 - [Parallel Execution](../guide/parallel.md) -- threading, backpressure,
   and data parallelism
+- [Recipes](../guide/recipes.md) -- real-world data engineering patterns

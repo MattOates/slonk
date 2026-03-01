@@ -375,7 +375,7 @@ class TestRoleProtocol:
         handler = SQLAlchemyHandler(TestModel, sf)
         assert isinstance(handler, Source)
 
-    def test_sqlalchemy_handler_is_not_transform(self) -> None:
+    def test_sqlalchemy_handler_is_transform(self) -> None:
         engine = create_engine(
             "sqlite:///:memory:",
             connect_args={"check_same_thread": False},
@@ -384,7 +384,18 @@ class TestRoleProtocol:
         TestBase.metadata.create_all(engine)
         sf = sessionmaker(bind=engine)
         handler = SQLAlchemyHandler(TestModel, sf)
-        assert not isinstance(handler, Transform)
+        assert isinstance(handler, Transform)
+
+    def test_sqlalchemy_handler_is_sink(self) -> None:
+        engine = create_engine(
+            "sqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        TestBase.metadata.create_all(engine)
+        sf = sessionmaker(bind=engine)
+        handler = SQLAlchemyHandler(TestModel, sf)
+        assert isinstance(handler, Sink)
 
     def test_callable_transform_is_transform(self) -> None:
         handler = _CallableTransform(lambda x: x)
@@ -548,6 +559,51 @@ class TestSQLAlchemyHandlerStreaming:
         # Same data as batch.
         batch_result = list(slonk.run_sync())
         assert result == batch_result
+
+    @pytest.mark.parallel_only()
+    def test_transform_upserts_in_pipeline(self, setup_db: sessionmaker) -> None:
+        """SQLAlchemyHandler as Transform in parallel: upserts + passes through."""
+
+        def generate(data: list[str]) -> list[str]:
+            return ["10\tParallel A", "11\tParallel B"]
+
+        slonk = Slonk(session_factory=setup_db) | generate | TestModel | "cat"
+        result = list(slonk.run_parallel(["seed"]))
+
+        assert "10\tParallel A" in result
+        assert "11\tParallel B" in result
+
+        # Verify rows persisted
+        handler = SQLAlchemyHandler(TestModel, setup_db)
+        source_result = list(handler.process_source())
+        assert "10\tParallel A" in source_result
+
+    @pytest.mark.parallel_only()
+    def test_sink_writes_in_pipeline(self, setup_db: sessionmaker) -> None:
+        """SQLAlchemyHandler as Sink in parallel: bulk-writes, returns empty."""
+
+        def generate(data: list[str]) -> list[str]:
+            return ["20\tSink Parallel A", "21\tSink Parallel B"]
+
+        slonk = Slonk(session_factory=setup_db) | generate | TestModel
+        result = list(slonk.run_parallel(["seed"]))
+
+        assert result == []
+
+        # Verify rows persisted
+        handler = SQLAlchemyHandler(TestModel, setup_db)
+        source_result = list(handler.process_source())
+        assert "20\tSink Parallel A" in source_result
+        assert "21\tSink Parallel B" in source_result
+
+    @pytest.mark.parallel_only()
+    def test_source_to_transform_round_trip(self, setup_db: sessionmaker) -> None:
+        """Read from one SQLAlchemy model, write through another (Transform), to cat."""
+        slonk = Slonk(session_factory=setup_db) | TestModel | TestModel | "cat"
+        result = list(slonk.run_parallel())
+
+        # Source reads, Transform upserts + passes through, cat echoes
+        assert result == ["1\tAlpha", "2\tBeta", "3\tGamma"]
 
 
 # ---------------------------------------------------------------------------

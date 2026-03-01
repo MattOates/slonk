@@ -175,6 +175,61 @@ class TestSQLAlchemyHandler:
         assert "2\tGoodbye World" in result
         assert "3\tTest Data" in result
 
+    def test_process_transform_upserts_and_passes_through(self, setup_db: sessionmaker) -> None:
+        handler = SQLAlchemyHandler(TestModel, setup_db)
+        new_data = ["4\tNew Item", "5\tAnother Item"]
+
+        result = list(handler.process_transform(new_data))
+
+        # Passthrough: all items returned unchanged
+        assert result == new_data
+
+        # Verify rows were upserted
+        source_result = list(handler.process_source())
+        assert "4\tNew Item" in source_result
+        assert "5\tAnother Item" in source_result
+
+    def test_process_transform_upserts_existing(self, setup_db: sessionmaker) -> None:
+        handler = SQLAlchemyHandler(TestModel, setup_db)
+        # Upsert an existing row with new data
+        updated_data = ["1\tUpdated Hello"]
+
+        result = list(handler.process_transform(updated_data))
+
+        assert result == updated_data
+        source_result = list(handler.process_source())
+        assert "1\tUpdated Hello" in source_result
+        assert "1\tHello World" not in source_result
+
+    def test_process_sink_writes_without_passthrough(self, setup_db: sessionmaker) -> None:
+        handler = SQLAlchemyHandler(TestModel, setup_db)
+        new_data = ["10\tSink Item A", "11\tSink Item B"]
+
+        result = handler.process_sink(new_data)
+
+        # Sink returns None
+        assert result is None
+
+        # Verify rows were written
+        source_result = list(handler.process_source())
+        assert "10\tSink Item A" in source_result
+        assert "11\tSink Item B" in source_result
+
+    def test_process_sink_upserts_existing(self, setup_db: sessionmaker) -> None:
+        handler = SQLAlchemyHandler(TestModel, setup_db)
+        updated_data = ["2\tSink Updated"]
+
+        handler.process_sink(updated_data)
+
+        source_result = list(handler.process_source())
+        assert "2\tSink Updated" in source_result
+        assert "2\tGoodbye World" not in source_result
+
+    def test_parse_record_bad_format(self, setup_db: sessionmaker) -> None:
+        handler = SQLAlchemyHandler(TestModel, setup_db)
+        with pytest.raises(ValueError, match="Expected"):
+            handler._parse_record("no-tab-here")
+
 
 class TestSlonk:
     def test_init(self) -> None:
@@ -365,7 +420,7 @@ class TestRoleProtocols:
         handler = SQLAlchemyHandler(TestModel, sf)
         assert isinstance(handler, Source)
 
-    def test_sqlalchemy_handler_is_not_transform(self) -> None:
+    def test_sqlalchemy_handler_is_transform(self) -> None:
         engine = create_engine(
             "sqlite:///:memory:",
             connect_args={"check_same_thread": False},
@@ -374,7 +429,18 @@ class TestRoleProtocols:
         TestBase.metadata.create_all(engine)
         sf = sessionmaker(bind=engine)
         handler = SQLAlchemyHandler(TestModel, sf)
-        assert not isinstance(handler, Transform)
+        assert isinstance(handler, Transform)
+
+    def test_sqlalchemy_handler_is_sink(self) -> None:
+        engine = create_engine(
+            "sqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        TestBase.metadata.create_all(engine)
+        sf = sessionmaker(bind=engine)
+        handler = SQLAlchemyHandler(TestModel, sf)
+        assert isinstance(handler, Sink)
 
     def test_tee_handler_is_transform(self) -> None:
         handler = TeeHandler(Slonk())
@@ -396,21 +462,16 @@ class TestRoleValidation:
 
     def test_source_only_in_middle_raises(self) -> None:
         """A Source-only handler in a middle position should error."""
-        engine = create_engine(
-            "sqlite:///:memory:",
-            connect_args={"check_same_thread": False},
-            poolclass=StaticPool,
-        )
-        TestBase.metadata.create_all(engine)
-        sf = sessionmaker(bind=engine)
-        # SQLAlchemyHandler is Source-only, placing it in the middle should fail
-        handler = SQLAlchemyHandler(TestModel, sf)
+
+        class SourceOnly:
+            def process_source(self) -> list[str]:
+                return ["a"]
 
         def identity(data: list[str]) -> list[str]:
             return list(data)
 
         slonk = Slonk() | identity
-        slonk.stages.append(handler)
+        slonk.stages.append(SourceOnly())  # type: ignore[arg-type]
         slonk.stages.append(ShellCommandHandler("cat"))
 
         with pytest.raises(TypeError, match="middle stage"):
@@ -487,3 +548,45 @@ class TestIntegration:
         assert "Hello World" in output
         assert "Hello Again" in output
         assert "Goodbye World" not in output
+
+    def test_sql_transform_in_middle(
+        self, setup_test_db: sessionmaker, run_pipeline: PipelineRunner
+    ) -> None:
+        """SQLAlchemyHandler as Transform in the middle: upserts + passes through."""
+        TestBase.metadata.create_all(setup_test_db().get_bind())
+
+        def generate_data(data: list[str]) -> list[str]:
+            return ["100\tGenerated A", "101\tGenerated B"]
+
+        slonk = Slonk(session_factory=setup_test_db) | generate_data | TestModel | "cat"
+        result = list(run_pipeline(slonk, ["seed"]))
+
+        assert "100\tGenerated A" in result
+        assert "101\tGenerated B" in result
+
+        # Verify the rows were actually written to the DB
+        handler = SQLAlchemyHandler(TestModel, setup_test_db)
+        source_result = list(handler.process_source())
+        assert "100\tGenerated A" in source_result
+        assert "101\tGenerated B" in source_result
+
+    def test_sql_sink_at_end(
+        self, setup_test_db: sessionmaker, run_pipeline: PipelineRunner
+    ) -> None:
+        """SQLAlchemyHandler as Sink at end: bulk-writes, returns empty."""
+        TestBase.metadata.create_all(setup_test_db().get_bind())
+
+        def generate_data(data: list[str]) -> list[str]:
+            return ["200\tSink Write A", "201\tSink Write B"]
+
+        slonk = Slonk(session_factory=setup_test_db) | generate_data | TestModel
+        result = list(run_pipeline(slonk, ["seed"]))
+
+        # Sink returns empty
+        assert result == []
+
+        # Verify data was written
+        handler = SQLAlchemyHandler(TestModel, setup_test_db)
+        source_result = list(handler.process_source())
+        assert "200\tSink Write A" in source_result
+        assert "201\tSink Write B" in source_result

@@ -72,6 +72,7 @@ nav:
       - Handlers: guide/handlers.md
       - Middleware: guide/middleware.md
       - Parallel Execution: guide/parallel.md
+      - Recipes: guide/recipes.md
   - API Reference:
       - slonk: reference/index.md
       - Pipeline: reference/pipeline.md
