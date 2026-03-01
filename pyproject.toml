@@ -1,6 +1,6 @@
 [project]
 name = "slonk"
-version = "0.3.0"
+version = "0.4.0"
 description = "Experiment in typed pipelining of data between python, shell and various data sources and sinks."
 authors = [
     { name = "Matt Oates", email = "mattoates+support@gmail.com" }

@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.4.0 (2026-03-01)
+
+### Features
+
+- Add generic types, combinators, shell source, timeout, and repr
+  ([`47c2ebb`](https://github.com/MattOates/slonk/commit/47c2ebbd43a0bda8f903f707ff8d3b2b9ab26689))
+
+
 ## v0.3.0 (2026-03-01)
 
 ### Features
