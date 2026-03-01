@@ -3,7 +3,7 @@
 These tests exercise behaviour specific to ``run_parallel()`` and the
 streaming pipeline — backpressure, concurrent stages, exception propagation,
 the ``parallel()`` data-parallelism wrapper, free-threading detection,
-and ``StreamingHandler`` protocol dispatch.
+and role-based protocol dispatch (``Source``, ``Transform``, ``Sink``).
 """
 
 from __future__ import annotations
@@ -23,14 +23,16 @@ from sqlalchemy.pool import StaticPool
 from slonk import (
     Base,
     ExampleModel,
-    Handler,
     PathHandler,
     ShellCommandHandler,
+    Sink,
     Slonk,
+    Source,
     SQLAlchemyHandler,
-    StreamingHandler,
     TeeHandler,
-    _CallableHandler,
+    Transform,
+    _CallableTransform,
+    _compute_roles,
     _is_free_threaded,
     _StreamingPipeline,
     parallel,
@@ -68,15 +70,15 @@ class TestFreeThreadingDetection:
 
 class TestStreamingPipeline:
     def test_empty_stages_returns_input(self) -> None:
-        sp = _StreamingPipeline(stages=[])
+        sp = _StreamingPipeline(stages=[], roles=[])
         assert sp.execute(["a", "b"]) == ["a", "b"]
 
     def test_empty_stages_none_input(self) -> None:
-        sp = _StreamingPipeline(stages=[])
+        sp = _StreamingPipeline(stages=[], roles=[])
         assert sp.execute(None) == []
 
     def test_single_stage(self) -> None:
-        def upper(data: list[str] | None) -> list[str]:
+        def upper(data: list[str]) -> list[str]:
             return [s.upper() for s in data] if data else []
 
         slonk = Slonk() | upper
@@ -86,13 +88,13 @@ class TestStreamingPipeline:
     def test_multi_stage_order_preserved(self) -> None:
         """Stages execute in order; data flows stage1 -> stage2 -> stage3."""
 
-        def add_a(data: list[str] | None) -> list[str]:
+        def add_a(data: list[str]) -> list[str]:
             return [s + "_a" for s in data] if data else []
 
-        def add_b(data: list[str] | None) -> list[str]:
+        def add_b(data: list[str]) -> list[str]:
             return [s + "_b" for s in data] if data else []
 
-        def add_c(data: list[str] | None) -> list[str]:
+        def add_c(data: list[str]) -> list[str]:
             return [s + "_c" for s in data] if data else []
 
         slonk = Slonk() | add_a | add_b | add_c
@@ -102,7 +104,7 @@ class TestStreamingPipeline:
     def test_result_ordering_matches_sync(self) -> None:
         """Parallel output is in the same order as sequential output."""
 
-        def number_lines(data: list[str] | None) -> list[str]:
+        def number_lines(data: list[str]) -> list[str]:
             return [f"{i}:{s}" for i, s in enumerate(data)] if data else []
 
         slonk = Slonk() | number_lines
@@ -123,13 +125,13 @@ class TestConcurrentExecution:
         """Verify that stages overlap in time (not purely sequential)."""
         timestamps: dict[str, list[float]] = {"stage1": [], "stage2": []}
 
-        def slow_stage1(data: list[str] | None) -> list[str]:
+        def slow_stage1(data: list[str]) -> list[str]:
             timestamps["stage1"].append(time.monotonic())
             time.sleep(0.05)
             timestamps["stage1"].append(time.monotonic())
             return list(data) if data else []
 
-        def slow_stage2(data: list[str] | None) -> list[str]:
+        def slow_stage2(data: list[str]) -> list[str]:
             timestamps["stage2"].append(time.monotonic())
             time.sleep(0.05)
             timestamps["stage2"].append(time.monotonic())
@@ -157,7 +159,7 @@ class TestBackpressure:
     def test_small_queue_does_not_lose_data(self) -> None:
         """Even with a tiny queue, all data gets through."""
 
-        def identity(data: list[str] | None) -> list[str]:
+        def identity(data: list[str]) -> list[str]:
             return list(data) if data else []
 
         slonk = Slonk() | identity
@@ -176,7 +178,7 @@ class TestExceptionPropagation:
     def test_stage_exception_propagates(self) -> None:
         """An exception in a stage thread is re-raised in the caller."""
 
-        def exploding_stage(data: Iterable[str] | None) -> list[str]:
+        def exploding_stage(data: Iterable[str]) -> list[str]:
             raise ValueError("boom")
 
         slonk = Slonk() | exploding_stage
@@ -185,10 +187,10 @@ class TestExceptionPropagation:
 
     @pytest.mark.parallel_only()
     def test_exception_in_middle_stage(self) -> None:
-        def ok_stage(data: list[str] | None) -> list[str]:
+        def ok_stage(data: list[str]) -> list[str]:
             return list(data) if data else []
 
-        def bad_stage(data: Iterable[str] | None) -> list[str]:
+        def bad_stage(data: Iterable[str]) -> list[str]:
             raise RuntimeError("mid-pipeline failure")
 
         slonk = Slonk() | ok_stage | bad_stage | ok_stage
@@ -203,20 +205,21 @@ class TestExceptionPropagation:
 
 class TestConcurrentTee:
     def test_tee_parallel_produces_same_result_as_sync(self) -> None:
-        def add_tag(data: list[str] | None) -> list[str]:
+        def add_tag(data: list[str]) -> list[str]:
             return [s + "_tagged" for s in data] if data else []
 
         side_pipeline = Slonk() | add_tag
         tee_handler = TeeHandler(side_pipeline)
 
         input_data = ["a", "b", "c"]
-        sync_result = sorted(tee_handler.process(input_data))
-        parallel_result = sorted(tee_handler.process_parallel(input_data))
+        sync_result = sorted(tee_handler.process_transform(input_data))
+        # process_transform always runs in the same way regardless of context
+        parallel_result = sorted(tee_handler.process_transform(input_data))
 
         assert parallel_result == sync_result
 
     def test_tee_in_pipeline_parallel(self) -> None:
-        def double(data: list[str] | None) -> list[str]:
+        def double(data: list[str]) -> list[str]:
             return [s + s for s in data] if data else []
 
         slonk = Slonk()
@@ -236,7 +239,7 @@ class TestRunAPI:
     def test_run_defaults_to_parallel(self) -> None:
         """run() with default args uses parallel execution."""
 
-        def identity(data: list[str] | None) -> list[str]:
+        def identity(data: list[str]) -> list[str]:
             return list(data) if data else []
 
         slonk = Slonk() | identity
@@ -244,7 +247,7 @@ class TestRunAPI:
         assert result == ["a", "b"]
 
     def test_run_parallel_false_uses_sync(self) -> None:
-        def identity(data: list[str] | None) -> list[str]:
+        def identity(data: list[str]) -> list[str]:
             return list(data) if data else []
 
         slonk = Slonk() | identity
@@ -252,7 +255,7 @@ class TestRunAPI:
         assert result == ["a", "b"]
 
     def test_run_sync_matches_run_parallel(self) -> None:
-        def transform(data: list[str] | None) -> list[str]:
+        def transform(data: list[str]) -> list[str]:
             return [s.upper() for s in data] if data else []
 
         slonk = Slonk() | transform
@@ -269,7 +272,7 @@ class TestParallelWrapper:
     def test_parallel_single_chunk_no_split(self) -> None:
         """When data fits in one chunk, no parallelism overhead."""
 
-        def upper(data: list[str] | None) -> list[str]:
+        def upper(data: list[str]) -> list[str]:
             return [s.upper() for s in data] if data else []
 
         slonk = Slonk() | parallel(upper, workers=2, chunk_size=100)
@@ -279,7 +282,7 @@ class TestParallelWrapper:
     def test_parallel_multiple_chunks_preserves_order(self) -> None:
         """Data is split, processed in parallel, and reassembled in order."""
 
-        def number(data: list[str] | None) -> list[str]:
+        def number(data: list[str]) -> list[str]:
             return [f"[{s}]" for s in data] if data else []
 
         slonk = Slonk() | parallel(number, workers=4, chunk_size=3)
@@ -290,29 +293,21 @@ class TestParallelWrapper:
     def test_parallel_with_lambda(self) -> None:
         """Lambdas work via cloudpickle serialisation (on GIL builds)."""
         handler = parallel(lambda data: [s[::-1] for s in data] if data else [], chunk_size=2)
-        result = list(handler.process(["abc", "def", "ghi"]))
+        result = list(handler.process_transform(["abc", "def", "ghi"]))
         assert result == ["cba", "fed", "ihg"]
 
     def test_parallel_empty_input(self) -> None:
-        def identity(data: list[str] | None) -> list[str]:
+        def identity(data: list[str]) -> list[str]:
             return list(data) if data else []
 
         handler = parallel(identity)
-        result = list(handler.process([]))
+        result = list(handler.process_transform([]))
         assert result == []
-
-    def test_parallel_none_input(self) -> None:
-        def handle_none(data: list[str] | None) -> list[str]:
-            return ["default"] if data is None else data
-
-        handler = parallel(handle_none)
-        result = list(handler.process(None))
-        assert result == ["default"]
 
     def test_parallel_in_pipeline(self) -> None:
         """parallel() handler works when piped into a Slonk pipeline."""
 
-        def double(data: list[str] | None) -> list[str]:
+        def double(data: list[str]) -> list[str]:
             return [s + s for s in data] if data else []
 
         slonk = Slonk() | parallel(double, workers=2, chunk_size=5)
@@ -324,14 +319,14 @@ class TestParallelWrapper:
         """On free-threaded Python, ThreadPoolExecutor is used."""
         thread_ids: list[int] = []
 
-        def record_thread(data: list[str] | None) -> list[str]:
+        def record_thread(data: list[str]) -> list[str]:
             thread_ids.append(threading.current_thread().ident or 0)
             return list(data) if data else []
 
         handler = parallel(record_thread, workers=2, chunk_size=2)
 
         with patch("slonk._is_free_threaded", return_value=True):
-            result = list(handler.process(["a", "b", "c", "d"]))
+            result = list(handler.process_transform(["a", "b", "c", "d"]))
 
         assert result == ["a", "b", "c", "d"]
         # Should have recorded threads from the pool
@@ -339,24 +334,38 @@ class TestParallelWrapper:
 
 
 # ---------------------------------------------------------------------------
-# StreamingHandler protocol detection
+# Role protocol detection
 # ---------------------------------------------------------------------------
 
 
-class TestStreamingHandlerProtocol:
-    """Verify that @runtime_checkable structural typing detects StreamingHandler correctly."""
+class TestRoleProtocol:
+    """Verify that @runtime_checkable structural typing detects Source/Transform/Sink correctly."""
 
-    def test_path_handler_is_streaming(self) -> None:
+    def test_path_handler_is_source(self) -> None:
         handler = PathHandler("/dev/null")
-        assert isinstance(handler, StreamingHandler)
-        assert isinstance(handler, Handler)
+        assert isinstance(handler, Source)
 
-    def test_shell_command_handler_is_streaming(self) -> None:
+    def test_path_handler_is_transform(self) -> None:
+        handler = PathHandler("/dev/null")
+        assert isinstance(handler, Transform)
+
+    def test_path_handler_is_sink(self) -> None:
+        handler = PathHandler("/dev/null")
+        assert isinstance(handler, Sink)
+
+    def test_shell_command_handler_is_transform(self) -> None:
         handler = ShellCommandHandler("echo hi")
-        assert isinstance(handler, StreamingHandler)
-        assert isinstance(handler, Handler)
+        assert isinstance(handler, Transform)
 
-    def test_sqlalchemy_handler_is_streaming(self) -> None:
+    def test_shell_command_handler_is_not_source(self) -> None:
+        handler = ShellCommandHandler("echo hi")
+        assert not isinstance(handler, Source)
+
+    def test_shell_command_handler_is_not_sink(self) -> None:
+        handler = ShellCommandHandler("echo hi")
+        assert not isinstance(handler, Sink)
+
+    def test_sqlalchemy_handler_is_source(self) -> None:
         engine = create_engine(
             "sqlite:///:memory:",
             connect_args={"check_same_thread": False},
@@ -365,33 +374,47 @@ class TestStreamingHandlerProtocol:
         Base.metadata.create_all(engine)
         sf = sessionmaker(bind=engine)
         handler = SQLAlchemyHandler(ExampleModel, sf)
-        assert isinstance(handler, StreamingHandler)
-        assert isinstance(handler, Handler)
+        assert isinstance(handler, Source)
 
-    def test_callable_handler_is_not_streaming(self) -> None:
-        handler = _CallableHandler(lambda x: x or [])
-        assert isinstance(handler, Handler)
-        assert not isinstance(handler, StreamingHandler)
+    def test_sqlalchemy_handler_is_not_transform(self) -> None:
+        engine = create_engine(
+            "sqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Base.metadata.create_all(engine)
+        sf = sessionmaker(bind=engine)
+        handler = SQLAlchemyHandler(ExampleModel, sf)
+        assert not isinstance(handler, Transform)
 
-    def test_tee_handler_is_not_streaming(self) -> None:
+    def test_callable_transform_is_transform(self) -> None:
+        handler = _CallableTransform(lambda x: x)
+        assert isinstance(handler, Transform)
+        assert not isinstance(handler, Source)
+        assert not isinstance(handler, Sink)
+
+    def test_tee_handler_is_transform(self) -> None:
         handler = TeeHandler(Slonk())
-        assert isinstance(handler, Handler)
-        assert not isinstance(handler, StreamingHandler)
+        assert isinstance(handler, Transform)
+        assert not isinstance(handler, Source)
+        assert not isinstance(handler, Sink)
 
-    def test_slonk_is_not_streaming(self) -> None:
+    def test_slonk_is_not_source_or_transform_or_sink(self) -> None:
         s = Slonk()
-        assert not isinstance(s, StreamingHandler)
+        assert not isinstance(s, Source)
+        assert not isinstance(s, Transform)
+        assert not isinstance(s, Sink)
 
 
 # ---------------------------------------------------------------------------
-# PathHandler streaming
+# PathHandler role methods
 # ---------------------------------------------------------------------------
 
 
 class TestPathHandlerStreaming:
     @pytest.mark.parallel_only()
-    def test_streaming_read(self) -> None:
-        """PathHandler.process_stream(None) yields file lines lazily."""
+    def test_source_read(self) -> None:
+        """PathHandler.process_source() yields file lines lazily."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
             f.write("alpha\nbeta\ngamma\n")
             f.flush()
@@ -399,20 +422,20 @@ class TestPathHandlerStreaming:
 
         try:
             handler = PathHandler(path)
-            lines = list(handler.process_stream(None))
+            lines = list(handler.process_source())
             assert lines == ["alpha\n", "beta\n", "gamma\n"]
         finally:
             os.unlink(path)
 
     @pytest.mark.parallel_only()
-    def test_streaming_write_passthrough(self) -> None:
-        """PathHandler.process_stream(data) writes to file and yields items."""
+    def test_transform_write_passthrough(self) -> None:
+        """PathHandler.process_transform(data) writes to file and yields items."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
             path = f.name
 
         try:
             handler = PathHandler(path)
-            result = list(handler.process_stream(iter(["one", "two", "three"])))
+            result = list(handler.process_transform(iter(["one", "two", "three"])))
             assert result == ["one", "two", "three"]
 
             # Verify the file was written correctly.
@@ -423,8 +446,8 @@ class TestPathHandlerStreaming:
             os.unlink(path)
 
     @pytest.mark.parallel_only()
-    def test_streaming_read_in_pipeline(self) -> None:
-        """PathHandler as a streaming stage reads a file in parallel mode."""
+    def test_source_read_in_pipeline(self) -> None:
+        """PathHandler as a Source reads a file in parallel mode."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
             f.write("line1\nline2\nline3\n")
             f.flush()
@@ -432,7 +455,7 @@ class TestPathHandlerStreaming:
 
         try:
 
-            def strip_lines(data: list[str] | None) -> list[str]:
+            def strip_lines(data: list[str]) -> list[str]:
                 return [s.strip() for s in data] if data else []
 
             slonk = Slonk() | path | strip_lines
@@ -443,48 +466,41 @@ class TestPathHandlerStreaming:
 
 
 # ---------------------------------------------------------------------------
-# ShellCommandHandler streaming
+# ShellCommandHandler role methods
 # ---------------------------------------------------------------------------
 
 
 class TestShellCommandHandlerStreaming:
     @pytest.mark.parallel_only()
-    def test_streaming_cat(self) -> None:
+    def test_transform_cat(self) -> None:
         """cat echoes each input line to stdout, yielded one at a time."""
         handler = ShellCommandHandler("cat")
-        result = list(handler.process_stream(iter(["hello", "world"])))
+        result = list(handler.process_transform(iter(["hello", "world"])))
         assert result == ["hello", "world"]
 
     @pytest.mark.parallel_only()
-    def test_streaming_sort(self) -> None:
+    def test_transform_sort(self) -> None:
         """sort buffers until EOF, then yields sorted lines."""
         handler = ShellCommandHandler("sort")
-        result = list(handler.process_stream(iter(["cherry", "apple", "banana"])))
+        result = list(handler.process_transform(iter(["cherry", "apple", "banana"])))
         assert result == ["apple", "banana", "cherry"]
 
     @pytest.mark.parallel_only()
-    def test_streaming_grep(self) -> None:
+    def test_transform_grep(self) -> None:
         """grep filters lines matching the pattern."""
         handler = ShellCommandHandler("grep hello")
-        result = list(handler.process_stream(iter(["hello world", "goodbye", "hello again"])))
+        result = list(handler.process_transform(iter(["hello world", "goodbye", "hello again"])))
         assert result == ["hello world", "hello again"]
 
     @pytest.mark.parallel_only()
-    def test_streaming_none_input(self) -> None:
-        """process_stream(None) returns immediately with no output."""
-        handler = ShellCommandHandler("echo should-not-run")
-        result = list(handler.process_stream(None))
-        assert result == []
-
-    @pytest.mark.parallel_only()
-    def test_streaming_command_failure(self) -> None:
+    def test_transform_command_failure(self) -> None:
         """Non-zero exit code raises RuntimeError."""
         handler = ShellCommandHandler("exit 1")
         with pytest.raises(RuntimeError, match="Command failed"):
-            list(handler.process_stream(iter(["data"])))
+            list(handler.process_transform(iter(["data"])))
 
     @pytest.mark.parallel_only()
-    def test_streaming_in_pipeline(self) -> None:
+    def test_transform_in_pipeline(self) -> None:
         """ShellCommandHandler streams through a parallel pipeline."""
         slonk = Slonk() | "grep hello"
         result = list(slonk.run_parallel(["hello world", "goodbye", "hello again"]))
@@ -492,7 +508,7 @@ class TestShellCommandHandlerStreaming:
 
 
 # ---------------------------------------------------------------------------
-# SQLAlchemyHandler streaming
+# SQLAlchemyHandler role methods
 # ---------------------------------------------------------------------------
 
 
@@ -519,22 +535,14 @@ class TestSQLAlchemyHandlerStreaming:
         return sf
 
     @pytest.mark.parallel_only()
-    def test_streaming_yields_rows(self, setup_db: sessionmaker) -> None:
-        """process_stream yields formatted rows via yield_per."""
+    def test_source_yields_rows(self, setup_db: sessionmaker) -> None:
+        """process_source yields formatted rows via yield_per."""
         handler = SQLAlchemyHandler(ExampleModel, setup_db)
-        result = list(handler.process_stream(None))
+        result = list(handler.process_source())
         assert result == ["1\tAlpha", "2\tBeta", "3\tGamma"]
 
     @pytest.mark.parallel_only()
-    def test_streaming_matches_batch(self, setup_db: sessionmaker) -> None:
-        """Streaming and batch produce equivalent rows (same data, same order)."""
-        handler = SQLAlchemyHandler(ExampleModel, setup_db)
-        batch_result = list(handler.process(None))
-        stream_result = list(handler.process_stream(None))
-        assert stream_result == batch_result
-
-    @pytest.mark.parallel_only()
-    def test_streaming_in_pipeline(self, setup_db: sessionmaker) -> None:
+    def test_source_in_pipeline(self, setup_db: sessionmaker) -> None:
         """SQLAlchemyHandler streams in a parallel pipeline."""
         slonk = Slonk(session_factory=setup_db) | ExampleModel
         result = list(slonk.run_parallel())
@@ -551,7 +559,7 @@ class TestSQLAlchemyHandlerStreaming:
 class TestMixedPipelines:
     @pytest.mark.parallel_only()
     def test_streaming_to_batch_stage(self) -> None:
-        """A StreamingHandler followed by a batch callable."""
+        """A Source/StreamingHandler followed by a batch callable."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
             f.write("a\nb\nc\n")
             f.flush()
@@ -559,7 +567,7 @@ class TestMixedPipelines:
 
         try:
 
-            def upper(data: list[str] | None) -> list[str]:
+            def upper(data: list[str]) -> list[str]:
                 return [s.strip().upper() for s in data] if data else []
 
             slonk = Slonk() | path | upper
@@ -570,9 +578,9 @@ class TestMixedPipelines:
 
     @pytest.mark.parallel_only()
     def test_batch_to_streaming_stage(self) -> None:
-        """A batch callable followed by a StreamingHandler."""
+        """A batch callable followed by a shell Transform."""
 
-        def generate(data: list[str] | None) -> list[str]:
+        def generate(data: list[str]) -> list[str]:
             return ["cherry", "apple", "banana"]
 
         slonk = Slonk() | generate | "sort"
@@ -581,7 +589,7 @@ class TestMixedPipelines:
 
     @pytest.mark.parallel_only()
     def test_streaming_to_streaming(self) -> None:
-        """Two consecutive StreamingHandlers (file -> shell)."""
+        """Two consecutive streaming stages (file Source -> shell Transform)."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
             f.write("hello world\ngoodbye\nhello again\n")
             f.flush()
@@ -605,7 +613,7 @@ class TestStreamingBackpressure:
     def test_small_queue_with_streaming_no_data_loss(self) -> None:
         """Bounded queue + streaming handlers don't lose data."""
 
-        def generate(data: list[str] | None) -> list[str]:
+        def generate(data: list[str]) -> list[str]:
             return [f"item_{i}" for i in range(50)]
 
         slonk = Slonk() | generate | "cat"
@@ -621,18 +629,13 @@ class TestStreamingBackpressure:
 class TestStreamingErrorPropagation:
     @pytest.mark.parallel_only()
     def test_error_mid_stream(self) -> None:
-        """A StreamingHandler that raises after partial output doesn't deadlock."""
+        """A Transform that raises after partial output doesn't deadlock."""
 
         class HalfBrokenHandler:
             """Yields a few items then explodes."""
 
-            def process(self, input_data: Iterable[str] | None) -> Iterable[str]:
-                return list(self.process_stream(input_data))
-
-            def process_stream(self, input_stream: Iterable[str] | None) -> Iterator[str]:
-                if input_stream is None:
-                    return
-                for i, item in enumerate(input_stream):
+            def process_transform(self, input_data: Iterable[str]) -> Iterator[str]:
+                for i, item in enumerate(input_data):
                     if i >= 2:
                         raise RuntimeError("mid-stream explosion")
                     yield item.upper()
@@ -645,13 +648,10 @@ class TestStreamingErrorPropagation:
 
     @pytest.mark.parallel_only()
     def test_error_in_first_streaming_stage(self) -> None:
-        """Exception in the first streaming stage propagates correctly."""
+        """Exception in the first stage propagates correctly."""
 
         class AlwaysFails:
-            def process(self, input_data: Iterable[str] | None) -> Iterable[str]:
-                raise ValueError("fail")
-
-            def process_stream(self, input_stream: Iterable[str] | None) -> Iterator[str]:
+            def process_transform(self, input_data: Iterable[str]) -> Iterator[str]:
                 raise ValueError("fail")
 
         slonk = Slonk()
@@ -662,66 +662,60 @@ class TestStreamingErrorPropagation:
 
 
 # ---------------------------------------------------------------------------
-# None vs empty input distinction
+# Role validation
 # ---------------------------------------------------------------------------
 
 
-class TestNoneVsEmptyInput:
-    @pytest.mark.parallel_only()
-    def test_process_stream_none_vs_empty(self) -> None:
-        """Streaming handlers can distinguish None input from empty input."""
-        received: list[str] = []
+class TestRoleValidation:
+    """Test _compute_roles raises on invalid stage/position combinations."""
 
-        class SentinelTracker:
-            def process(self, input_data: Iterable[str] | None) -> Iterable[str]:
-                return list(self.process_stream(input_data))
+    def test_source_required_without_seed(self) -> None:
+        """First stage with no seed must implement Source."""
 
-            def process_stream(self, input_stream: Iterable[str] | None) -> Iterator[str]:
-                if input_stream is None:
-                    received.append("got_none")
-                    yield "none"
-                else:
-                    items = list(input_stream)
-                    if not items:
-                        received.append("got_empty")
-                        yield "empty"
-                    else:
-                        received.append("got_data")
-                        yield from items
+        class OnlyTransform:
+            def process_transform(self, input_data: Iterable[str]) -> Iterable[str]:
+                return input_data
 
-        slonk = Slonk()
-        slonk.stages.append(SentinelTracker())  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="does not implement Source"):
+            _compute_roles([OnlyTransform()], has_seed=False)  # type: ignore[list-item]
 
-        result = list(slonk.run_parallel(None))
-        assert result == ["none"]
-        assert received == ["got_none"]
+    def test_transform_required_with_seed(self) -> None:
+        """First stage of multi-stage pipeline with seed must implement Transform."""
 
-    @pytest.mark.parallel_only()
-    def test_process_stream_receives_empty_for_empty_input(self) -> None:
-        """Empty list input (not None) gives an empty iterator, not None."""
-        received: list[str] = []
+        class OnlySource:
+            def process_source(self) -> Iterable[str]:
+                return ["a"]
 
-        class SentinelTracker:
-            def process(self, input_data: Iterable[str] | None) -> Iterable[str]:
-                return list(self.process_stream(input_data))
+        class OnlyTransformForMiddle:
+            def process_transform(self, input_data: Iterable[str]) -> Iterable[str]:
+                return input_data
 
-            def process_stream(self, input_stream: Iterable[str] | None) -> Iterator[str]:
-                if input_stream is None:
-                    received.append("got_none")
-                else:
-                    items = list(input_stream)
-                    if not items:
-                        received.append("got_empty")
-                    else:
-                        received.append("got_data")
-                        yield from items
+        with pytest.raises(TypeError, match="does not implement Transform"):
+            _compute_roles(
+                [OnlySource(), OnlyTransformForMiddle()],  # type: ignore[list-item]
+                has_seed=True,
+            )
 
-        slonk = Slonk()
-        slonk.stages.append(SentinelTracker())  # type: ignore[arg-type]
+    def test_middle_stage_must_be_transform(self) -> None:
+        """Middle stages must implement Transform."""
 
-        result = list(slonk.run_parallel([]))
-        assert result == []
-        assert received == ["got_empty"]
+        class OnlySink:
+            def process_sink(self, input_data: Iterable[str]) -> None:
+                pass
+
+        class GoodSource:
+            def process_source(self) -> Iterable[str]:
+                return []
+
+        class GoodTransform:
+            def process_transform(self, input_data: Iterable[str]) -> Iterable[str]:
+                return input_data
+
+        with pytest.raises(TypeError, match="does not implement Transform"):
+            _compute_roles(
+                [GoodSource(), OnlySink(), GoodTransform()],  # type: ignore[list-item]
+                has_seed=False,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -732,9 +726,9 @@ class TestNoneVsEmptyInput:
 class TestGeneratorAutoStreaming:
     @pytest.mark.parallel_only()
     def test_generator_callable_streams_lazily(self) -> None:
-        """A callable returning a generator naturally streams via the batch path."""
+        """A callable returning a generator naturally streams via the Transform path."""
 
-        def gen(data: list[str] | None) -> Iterable[str]:
+        def gen(data: list[str]) -> Iterable[str]:
             if data:
                 for item in data:
                     yield item.upper()

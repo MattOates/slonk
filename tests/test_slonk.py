@@ -15,9 +15,12 @@ from slonk import (
     ExampleModel,
     PathHandler,
     ShellCommandHandler,
+    Sink,
     Slonk,
+    Source,
     SQLAlchemyHandler,
     TeeHandler,
+    Transform,
     tee,
 )
 
@@ -48,27 +51,7 @@ class TestPathHandler:
         finally:
             os.unlink(tmp_path)
 
-    def test_process_with_input_data(self) -> None:
-        with tempfile.NamedTemporaryFile(mode="w", delete=False) as tmp:
-            tmp_path = tmp.name
-
-        try:
-            handler = PathHandler(tmp_path)
-            test_data = ["test", "data"]
-
-            result = list(handler.process(test_data))
-
-            # Should return the input data
-            assert result == test_data
-
-            # Should also write to file
-            with open(tmp_path) as f:
-                content = f.read()
-                assert content == "test\ndata\n"
-        finally:
-            os.unlink(tmp_path)
-
-    def test_process_without_input_data(self) -> None:
+    def test_process_source(self) -> None:
         with tempfile.NamedTemporaryFile(mode="w", delete=False) as tmp:
             tmp_path = tmp.name
 
@@ -78,9 +61,49 @@ class TestPathHandler:
                 f.write("existing\ncontent\n")
 
             handler = PathHandler(tmp_path)
-            result = list(handler.process(None))
+            result = list(handler.process_source())
 
             assert result == ["existing\n", "content\n"]
+        finally:
+            os.unlink(tmp_path)
+
+    def test_process_transform(self) -> None:
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        try:
+            handler = PathHandler(tmp_path)
+            test_data = ["test", "data"]
+
+            result = list(handler.process_transform(test_data))
+
+            # Should return the input data (passthrough)
+            assert result == test_data
+
+            # Should also write to file
+            with open(tmp_path) as f:
+                content = f.read()
+                assert content == "test\ndata\n"
+        finally:
+            os.unlink(tmp_path)
+
+    def test_process_sink(self) -> None:
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        try:
+            handler = PathHandler(tmp_path)
+            test_data = ["sink", "data"]
+
+            result = handler.process_sink(test_data)
+
+            # Sink returns None
+            assert result is None
+
+            # Should write to file
+            with open(tmp_path) as f:
+                content = f.read()
+                assert content == "sink\ndata\n"
         finally:
             os.unlink(tmp_path)
 
@@ -100,38 +123,24 @@ class TestShellCommandHandler:
         with pytest.raises(RuntimeError, match="Command failed with error"):
             handler._run_command("")
 
-    def test_process_with_input_data(self) -> None:
+    def test_process_transform(self) -> None:
         handler = ShellCommandHandler("cat")
         test_data = ["hello", "world"]
 
-        result = list(handler.process(test_data))
+        result = list(handler.process_transform(test_data))
+        assert result == ["hello", "world"]
 
-        assert len(result) == 1
-        assert "hello\nworld" in result[0]
-
-    def test_process_without_input_data(self) -> None:
-        handler = ShellCommandHandler("echo test")
-        result = list(handler.process(None))
-        assert result == []
-
-    def test_process_with_grep(self) -> None:
+    def test_process_transform_with_grep(self) -> None:
         handler = ShellCommandHandler("grep hello")
         test_data = ["hello world", "goodbye world", "hello again"]
 
-        result = list(handler.process(test_data))
-
-        assert len(result) == 1
-        output = result[0]
-        assert "hello world" in output
-        assert "hello again" in output
-        assert "goodbye world" not in output
+        result = list(handler.process_transform(test_data))
+        assert result == ["hello world", "hello again"]
 
 
 class TestSQLAlchemyHandler:
     @pytest.fixture()
     def setup_db(self) -> sessionmaker:
-        # Use StaticPool + check_same_thread=False so the in-memory DB is
-        # accessible from the streaming pipeline's worker threads.
         engine = create_engine(
             "sqlite:///:memory:",
             connect_args={"check_same_thread": False},
@@ -140,7 +149,6 @@ class TestSQLAlchemyHandler:
         Base.metadata.create_all(engine)
         Session = sessionmaker(bind=engine)
 
-        # Add test data
         session = Session()
         session.add_all(
             [
@@ -158,21 +166,14 @@ class TestSQLAlchemyHandler:
         handler = SQLAlchemyHandler(ExampleModel, setup_db)
         assert handler.model == ExampleModel
 
-    def test_process(self, setup_db: sessionmaker) -> None:
+    def test_process_source(self, setup_db: sessionmaker) -> None:
         handler = SQLAlchemyHandler(ExampleModel, setup_db)
-        result = list(handler.process(None))
+        result = list(handler.process_source())
 
         assert len(result) == 3
         assert "1\tHello World" in result
         assert "2\tGoodbye World" in result
         assert "3\tTest Data" in result
-
-    def test_process_with_input_data(self, setup_db: sessionmaker) -> None:
-        handler = SQLAlchemyHandler(ExampleModel, setup_db)
-        # Input data is ignored for SQL handler
-        result = list(handler.process(["ignored", "input"]))
-
-        assert len(result) == 3
 
 
 class TestSlonk:
@@ -241,9 +242,7 @@ class TestSlonk:
             slonk | 42
 
     def test_run_simple_pipeline(self, run_pipeline: PipelineRunner) -> None:
-        def double_lines(data: list[str] | None) -> list[str]:
-            if data is None:
-                return []
+        def double_lines(data: list[str]) -> list[str]:
             return [line + line for line in data]
 
         slonk = Slonk() | double_lines
@@ -258,14 +257,10 @@ class TestSlonk:
         assert result == ["test"]
 
     def test_run_multi_stage_pipeline(self, run_pipeline: PipelineRunner) -> None:
-        def add_prefix(data: list[str] | None) -> list[str]:
-            if data is None:
-                return []
+        def add_prefix(data: list[str]) -> list[str]:
             return [f"prefix_{line}" for line in data]
 
-        def add_suffix(data: list[str] | None) -> list[str]:
-            if data is None:
-                return []
+        def add_suffix(data: list[str]) -> list[str]:
             return [f"{line}_suffix" for line in data]
 
         slonk = Slonk() | add_prefix | add_suffix
@@ -275,7 +270,6 @@ class TestSlonk:
 
     @patch("slonk.UPath")
     def test_or_with_cloud_path(self, mock_upath: MagicMock) -> None:
-        # Mock UPath to avoid actual cloud operations
         mock_instance = MagicMock()
         mock_upath.return_value = mock_instance
 
@@ -308,26 +302,18 @@ class TestTeeHandler:
         tee_handler = TeeHandler(pipeline)
         assert tee_handler.pipeline is pipeline
 
-    def test_process_with_input_data(self) -> None:
-        def add_b(data: list[str] | None) -> list[str]:
-            return [line + "_b" for line in data] if data else []
+    def test_process_transform(self) -> None:
+        def add_b(data: list[str]) -> list[str]:
+            return [line + "_b" for line in data]
 
         tee_pipeline = Slonk() | add_b
         tee_handler = TeeHandler(tee_pipeline)
 
-        result = list(tee_handler.process(["test"]))
+        result = list(tee_handler.process_transform(["test"]))
 
         # Should include both original data and tee pipeline results
         assert "test" in result
         assert "test_b" in result
-
-    def test_process_without_input_data(self) -> None:
-        pipeline = Slonk()
-        tee_handler = TeeHandler(pipeline)
-
-        result = list(tee_handler.process(None))
-
-        assert result == []
 
 
 class TestTeeFunction:
@@ -341,9 +327,100 @@ class TestTeeFunction:
         assert result.stages[0].pipeline is pipeline
 
 
+class TestRoleProtocols:
+    """Verify that @runtime_checkable structural typing detects roles correctly."""
+
+    def test_path_handler_is_source(self) -> None:
+        handler = PathHandler("/dev/null")
+        assert isinstance(handler, Source)
+
+    def test_path_handler_is_transform(self) -> None:
+        handler = PathHandler("/dev/null")
+        assert isinstance(handler, Transform)
+
+    def test_path_handler_is_sink(self) -> None:
+        handler = PathHandler("/dev/null")
+        assert isinstance(handler, Sink)
+
+    def test_shell_command_handler_is_transform(self) -> None:
+        handler = ShellCommandHandler("echo hi")
+        assert isinstance(handler, Transform)
+
+    def test_shell_command_handler_is_not_source(self) -> None:
+        handler = ShellCommandHandler("echo hi")
+        assert not isinstance(handler, Source)
+
+    def test_shell_command_handler_is_not_sink(self) -> None:
+        handler = ShellCommandHandler("echo hi")
+        assert not isinstance(handler, Sink)
+
+    def test_sqlalchemy_handler_is_source(self) -> None:
+        engine = create_engine(
+            "sqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Base.metadata.create_all(engine)
+        sf = sessionmaker(bind=engine)
+        handler = SQLAlchemyHandler(ExampleModel, sf)
+        assert isinstance(handler, Source)
+
+    def test_sqlalchemy_handler_is_not_transform(self) -> None:
+        engine = create_engine(
+            "sqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Base.metadata.create_all(engine)
+        sf = sessionmaker(bind=engine)
+        handler = SQLAlchemyHandler(ExampleModel, sf)
+        assert not isinstance(handler, Transform)
+
+    def test_tee_handler_is_transform(self) -> None:
+        handler = TeeHandler(Slonk())
+        assert isinstance(handler, Transform)
+
+    def test_tee_handler_is_not_source(self) -> None:
+        handler = TeeHandler(Slonk())
+        assert not isinstance(handler, Source)
+
+
+class TestRoleValidation:
+    """Verify that role validation catches invalid pipeline configurations."""
+
+    def test_transform_only_as_first_stage_no_seed_raises(self) -> None:
+        """A Transform-only handler as first stage with no seed data should error."""
+        slonk = Slonk() | "grep foo"
+        with pytest.raises(TypeError, match="does not implement Source"):
+            list(slonk.run(None))
+
+    def test_source_only_in_middle_raises(self) -> None:
+        """A Source-only handler in a middle position should error."""
+        engine = create_engine(
+            "sqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Base.metadata.create_all(engine)
+        sf = sessionmaker(bind=engine)
+        # SQLAlchemyHandler is Source-only, placing it in the middle should fail
+        handler = SQLAlchemyHandler(ExampleModel, sf)
+
+        def identity(data: list[str]) -> list[str]:
+            return list(data)
+
+        slonk = Slonk() | identity
+        slonk.stages.append(handler)
+        slonk.stages.append(ShellCommandHandler("cat"))
+
+        with pytest.raises(TypeError, match="middle stage"):
+            list(slonk.run(["data"]))
+
+
 class TestIntegration:
     def test_shell_command_pipeline(self, run_pipeline: PipelineRunner) -> None:
         slonk = Slonk() | "echo hello"
+        # ShellCommandHandler is Transform-only, needs seed data
         result = list(run_pipeline(slonk, ["input"]))
 
         assert len(result) == 1
@@ -353,11 +430,11 @@ class TestIntegration:
         with tempfile.TemporaryDirectory() as tmpdir:
             test_file = os.path.join(tmpdir, "test.txt")
 
-            # Write pipeline
+            # Write pipeline — PathHandler as Sink (last stage with seed data)
             write_slonk = Slonk() | test_file
             run_pipeline(write_slonk, ["hello", "world"])
 
-            # Read pipeline
+            # Read pipeline — PathHandler as Source (first stage, no seed)
             read_slonk = Slonk() | test_file
             result = list(run_pipeline(read_slonk))
 
@@ -367,24 +444,20 @@ class TestIntegration:
         with tempfile.TemporaryDirectory() as tmpdir:
             test_file = os.path.join(tmpdir, "test.txt")
 
-            def add_prefix(data: list[str] | None) -> list[str]:
-                return [f">> {line}" for line in data] if data else []
+            def add_prefix(data: list[str]) -> list[str]:
+                return [f">> {line}" for line in data]
 
-            # Combined pipeline: transform -> save -> shell process
+            # Combined pipeline: transform -> save (transform passthrough) -> shell
             slonk = Slonk() | add_prefix | test_file | "grep '>>'"
 
             result = list(run_pipeline(slonk, ["line1", "line2"]))
 
-            # Sync mode: batch ShellCommandHandler returns one combined string.
-            # Parallel mode: streaming ShellCommandHandler yields one line per item.
             output = "\n".join(result)
             assert ">> line1" in output
             assert ">> line2" in output
 
     @pytest.fixture()
     def setup_test_db(self) -> sessionmaker:
-        # Use StaticPool + check_same_thread=False so the in-memory DB is
-        # accessible from the streaming pipeline's worker threads.
         engine = create_engine(
             "sqlite:///:memory:",
             connect_args={"check_same_thread": False},
@@ -396,7 +469,6 @@ class TestIntegration:
     def test_sql_to_shell_pipeline(
         self, setup_test_db: sessionmaker, run_pipeline: PipelineRunner
     ) -> None:
-        # Add test data
         session = setup_test_db()
         session.add_all(
             [
@@ -411,8 +483,6 @@ class TestIntegration:
         slonk = Slonk(session_factory=setup_test_db) | ExampleModel | "grep Hello"
         result = list(run_pipeline(slonk))
 
-        # Sync mode: batch ShellCommandHandler returns one combined string.
-        # Parallel mode: streaming ShellCommandHandler yields one line per item.
         output = "\n".join(result)
         assert "Hello World" in output
         assert "Hello Again" in output

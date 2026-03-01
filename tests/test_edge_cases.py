@@ -43,30 +43,30 @@ class TestErrorHandling:
 
     def test_shell_command_handler_empty_input(self) -> None:
         handler = ShellCommandHandler("cat")
-        result = list(handler.process([]))
+        result = list(handler.process_transform([]))
 
-        assert result == [""]
+        assert result == []
 
     def test_slonk_chaining_with_none_output(self, run_pipeline: PipelineRunner) -> None:
-        def return_none(data: object) -> None:
-            return None
+        def return_empty(data: list[str]) -> list[str]:
+            return []
 
-        def process_none(data: object) -> list[str]:
-            return ["processed"] if data is None else list(data)  # type: ignore[arg-type]
+        def process_none(data: list[str]) -> list[str]:
+            items = list(data)
+            return ["processed"] if not items else items
 
-        slonk = Slonk() | return_none | process_none
+        slonk = Slonk() | return_empty | process_none
         result = list(run_pipeline(slonk, ["input"]))
 
         assert result == ["processed"]
 
     def test_slonk_with_generator_stages(self, run_pipeline: PipelineRunner) -> None:
-        def generator_stage(data: list[str] | None) -> Iterator[str]:
-            if data:
-                for item in data:
-                    yield f"gen_{item}"
+        def generator_stage(data: list[str]) -> Iterator[str]:
+            for item in data:
+                yield f"gen_{item}"
 
-        def list_stage(data: list[str] | None) -> list[str]:
-            return list(data) if data else []
+        def list_stage(data: list[str]) -> list[str]:
+            return list(data)
 
         slonk = Slonk() | generator_stage | list_stage
         result = list(run_pipeline(slonk, ["a", "b"]))
@@ -74,19 +74,19 @@ class TestErrorHandling:
         assert result == ["gen_a", "gen_b"]
 
     def test_empty_data_through_pipeline(self, run_pipeline: PipelineRunner) -> None:
-        def add_prefix(data: list[str] | None) -> list[str]:
-            return [f"prefix_{item}" for item in data] if data else []
+        def add_prefix(data: list[str]) -> list[str]:
+            return [f"prefix_{item}" for item in data]
 
         slonk = Slonk() | add_prefix
         result = list(run_pipeline(slonk, []))
 
         assert result == []
 
-    def test_slonk_run_with_none_input(self, run_pipeline: PipelineRunner) -> None:
-        def handle_none(data: list[str] | None) -> list[str]:
-            return ["default"] if data is None else data
+    def test_slonk_run_with_none_input_and_source(self, run_pipeline: PipelineRunner) -> None:
+        def produce_default() -> list[str]:
+            return ["default"]
 
-        slonk = Slonk() | handle_none
+        slonk = Slonk() | produce_default
         result = list(run_pipeline(slonk, None))
 
         assert result == ["default"]
@@ -94,8 +94,8 @@ class TestErrorHandling:
 
 class TestEdgeCases:
     def test_large_data_processing(self, run_pipeline: PipelineRunner) -> None:
-        def identity(data: list[str] | None) -> list[str]:
-            return list(data) if data else []
+        def identity(data: list[str]) -> list[str]:
+            return list(data)
 
         # Test with a larger dataset
         large_data = [f"line_{i}" for i in range(1000)]
@@ -124,11 +124,11 @@ class TestEdgeCases:
             os.unlink(tmp_path)
 
     def test_nested_slonk_pipelines(self, run_pipeline: PipelineRunner) -> None:
-        def add_a(data: list[str] | None) -> list[str]:
-            return [f"{item}_a" for item in data] if data else []
+        def add_a(data: list[str]) -> list[str]:
+            return [f"{item}_a" for item in data]
 
-        def add_b(data: list[str] | None) -> list[str]:
-            return [f"{item}_b" for item in data] if data else []
+        def add_b(data: list[str]) -> list[str]:
+            return [f"{item}_b" for item in data]
 
         # Create nested pipeline
         inner_pipeline = Slonk() | add_b
@@ -140,22 +140,18 @@ class TestEdgeCases:
     def test_multiline_shell_output(self) -> None:
         # Test shell command that produces multiline output
         handler = ShellCommandHandler("echo -e 'line1\\nline2\\nline3'")
-        result = list(handler.process(["ignored"]))
+        result = list(handler.process_transform(["ignored"]))
 
-        assert len(result) == 1
-        output = result[0]
+        assert len(result) >= 1
+        output = "\n".join(result)
         assert "line1" in output
         assert "line2" in output
         assert "line3" in output
 
     def test_binary_data_handling(self, run_pipeline: PipelineRunner) -> None:
         # Test that the system handles binary-like data gracefully
-        def binary_to_hex(data: list[str] | None) -> list[str]:
-            return (
-                [item.encode().hex() if isinstance(item, str) else str(item) for item in data]
-                if data
-                else []
-            )
+        def binary_to_hex(data: list[str]) -> list[str]:
+            return [item.encode().hex() if isinstance(item, str) else str(item) for item in data]
 
         slonk = Slonk() | binary_to_hex
         result = list(run_pipeline(slonk, ["hello", "world"]))
@@ -193,7 +189,7 @@ class TestSlonkPipelineTypes:
 
     def test_callable_with_annotations(self, run_pipeline: PipelineRunner) -> None:
         def annotated_func(data: list[str]) -> list[str]:
-            return [item.upper() for item in data] if data else []
+            return [item.upper() for item in data]
 
         slonk = Slonk() | annotated_func
         result = list(run_pipeline(slonk, ["hello", "world"]))
@@ -201,7 +197,7 @@ class TestSlonkPipelineTypes:
         assert result == ["HELLO", "WORLD"]
 
     def test_lambda_function(self, run_pipeline: PipelineRunner) -> None:
-        slonk = Slonk() | (lambda data: [item[::-1] for item in data] if data else [])
+        slonk = Slonk() | (lambda data: [item[::-1] for item in data])
         result = list(run_pipeline(slonk, ["hello", "world"]))
 
         assert result == ["olleh", "dlrow"]

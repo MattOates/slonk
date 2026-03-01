@@ -1,11 +1,15 @@
+from __future__ import annotations
+
 import contextlib
+import enum
+import inspect
 import subprocess
 import sys
 import threading
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from queue import Queue
-from typing import Any, Protocol, Union, runtime_checkable
+from typing import Any, Protocol, get_type_hints, runtime_checkable
 
 import cloudpickle
 from sqlalchemy import Column, String, create_engine, select
@@ -15,13 +19,14 @@ from upath import UPath
 __all__ = [
     "Base",
     "ExampleModel",
-    "Handler",
     "PathHandler",
     "SQLAlchemyHandler",
     "ShellCommandHandler",
+    "Sink",
     "Slonk",
-    "StreamingHandler",
+    "Source",
     "TeeHandler",
+    "Transform",
     "parallel",
     "tee",
 ]
@@ -63,10 +68,6 @@ _KNOWN_PATH_PROTOCOLS = frozenset(
 # Sentinel signalling end-of-stream between threaded stages.
 _DONE = object()
 
-# Sentinel placed *before* _DONE when the original input_data was None.
-# Allows streaming stages to distinguish "no input" from "empty input".
-_NONE_INPUT = object()
-
 # Default bounded-queue size for streaming pipeline backpressure.
 _DEFAULT_MAX_QUEUE_SIZE = 1024
 
@@ -104,32 +105,152 @@ class ExampleModel(Base):
 
 
 # ---------------------------------------------------------------------------
-# Handler protocols
+# Stage role enum
+# ---------------------------------------------------------------------------
+
+
+class _Role(enum.Enum):
+    """The role a stage plays in the pipeline based on its position."""
+
+    SOURCE = "source"
+    TRANSFORM = "transform"
+    SINK = "sink"
+
+
+# ---------------------------------------------------------------------------
+# Handler role protocols
 # ---------------------------------------------------------------------------
 
 
 @runtime_checkable
-class Handler(Protocol):
-    def process(self, input_data: Iterable[str] | None) -> Iterable[str]: ...
+class Source(Protocol):
+    """A stage that produces data from nothing (first stage, no seed data).
+
+    Return an ``Iterable[str]``.  If the iterable is a generator the pipeline
+    will stream items lazily; if it is a list they are pushed in one go.
+    """
+
+    def process_source(self) -> Iterable[str]: ...
 
 
 @runtime_checkable
-class StreamingHandler(Handler, Protocol):
-    """A handler that can process items lazily via an iterator.
+class Transform(Protocol):
+    """A stage that receives input and produces output.
 
-    ``process_stream`` receives a lazy iterable (which may be backed by a
-    queue) and yields result items one at a time.  The pipeline pushes each
-    yielded item to the next stage immediately, enabling true item-level
-    streaming and backpressure.
-
-    Every ``StreamingHandler`` must also implement ``process`` for use by
-    the synchronous ``run_sync()`` path.  A simple implementation is::
-
-        def process(self, input_data):
-            return list(self.process_stream(input_data))
+    ``input_data`` is always a real ``Iterable[str]`` — never ``None``.
+    In parallel mode it may be a lazy queue-backed iterator; in sync mode
+    it is typically a list.  Handlers may iterate it however they like.
     """
 
-    def process_stream(self, input_stream: Iterable[str] | None) -> Iterator[str]: ...
+    def process_transform(self, input_data: Iterable[str]) -> Iterable[str]: ...
+
+
+@runtime_checkable
+class Sink(Protocol):
+    """A stage that consumes input as the final pipeline stage.
+
+    Returns ``None``.  The pipeline's return value when ending with a
+    ``Sink`` is an empty list.
+    """
+
+    def process_sink(self, input_data: Iterable[str]) -> None: ...
+
+
+# ---------------------------------------------------------------------------
+# Stage type alias
+# ---------------------------------------------------------------------------
+
+# Type alias for stages.  Slonk sub-pipelines act as Transform.
+type StageType = Source | Transform | Sink | "Slonk"
+
+
+# ---------------------------------------------------------------------------
+# Role validation helpers
+# ---------------------------------------------------------------------------
+
+
+def _compute_roles(
+    stages: list[StageType],
+    *,
+    has_seed: bool,
+) -> list[_Role]:
+    """Determine the role each stage should play.
+
+    Raises ``TypeError`` if a stage cannot fulfil its required role.
+    """
+    n = len(stages)
+    if n == 0:
+        return []
+
+    roles: list[_Role] = []
+    for i, stage in enumerate(stages):
+        is_first = i == 0
+        is_last = i == n - 1
+
+        # Slonk sub-pipelines always act as Transform (take input, produce output).
+        is_slonk = isinstance(stage, Slonk)
+
+        if is_first and is_last:
+            # Single-stage pipeline.
+            if has_seed:
+                # Prefer Sink, else Transform.
+                if isinstance(stage, Sink):
+                    roles.append(_Role.SINK)
+                elif isinstance(stage, Transform) or is_slonk:
+                    roles.append(_Role.TRANSFORM)
+                else:
+                    raise TypeError(
+                        f"Stage 0 ({type(stage).__name__}) receives seed data but "
+                        f"implements neither Transform nor Sink."
+                    )
+            else:
+                if isinstance(stage, Source):
+                    roles.append(_Role.SOURCE)
+                else:
+                    raise TypeError(
+                        f"Stage 0 ({type(stage).__name__}) is the first stage with no "
+                        f"seed data but does not implement Source."
+                    )
+        elif is_first:
+            # First of multiple stages.
+            if has_seed:
+                if isinstance(stage, Transform) or is_slonk:
+                    roles.append(_Role.TRANSFORM)
+                else:
+                    raise TypeError(
+                        f"Stage 0 ({type(stage).__name__}) receives seed data but "
+                        f"does not implement Transform."
+                    )
+            else:
+                if isinstance(stage, Source):
+                    roles.append(_Role.SOURCE)
+                else:
+                    raise TypeError(
+                        f"Stage 0 ({type(stage).__name__}) is the first stage with no "
+                        f"seed data but does not implement Source."
+                    )
+        elif is_last:
+            # Last of multiple stages — receives input from previous.
+            if isinstance(stage, Sink):
+                roles.append(_Role.SINK)
+            elif isinstance(stage, Transform) or is_slonk:
+                roles.append(_Role.TRANSFORM)
+            else:
+                raise TypeError(
+                    f"Stage {i} ({type(stage).__name__}) is the last stage but "
+                    f"implements neither Transform nor Sink."
+                )
+        else:
+            # Middle stage.
+            if isinstance(stage, Transform) or is_slonk:
+                roles.append(_Role.TRANSFORM)
+            else:
+                raise TypeError(
+                    f"Stage {i} ({type(stage).__name__}) is a middle stage but "
+                    f"does not implement Transform."
+                )
+
+    return roles
 
 
 # ---------------------------------------------------------------------------
@@ -138,22 +259,16 @@ class StreamingHandler(Handler, Protocol):
 
 
 def _queue_iter(q: Queue[Any]) -> Iterator[str]:
-    """Yield items from *q* until the ``_DONE`` sentinel is received.
-
-    The ``_NONE_INPUT`` sentinel (if present) is silently skipped so that
-    callers always see a clean stream of data items.
-    """
+    """Yield items from *q* until the ``_DONE`` sentinel is received."""
     while True:
         item = q.get()
         if item is _DONE:
             return
-        if item is _NONE_INPUT:
-            continue
         yield item
 
 
 class _QueueDrainState:
-    """Mutable flag shared between ``_queue_to_stream_input`` and ``_run_stage``.
+    """Mutable flag shared between the queue iterator and ``_run_stage``.
 
     Set to ``True`` once the ``_DONE`` sentinel has been consumed from the
     input queue, so the error handler in ``_run_stage`` knows not to call
@@ -166,48 +281,14 @@ class _QueueDrainState:
         self.done = False
 
 
-def _queue_to_stream_input(
-    q: Queue[Any],
-    state: _QueueDrainState,
-) -> Iterable[str] | None:
-    """Read the input queue and return either ``None`` or a lazy iterator.
-
-    Returns ``None`` when the original ``input_data`` was ``None``
-    (signalled by the ``_NONE_INPUT`` sentinel), allowing streaming
-    handlers to distinguish "no input" from "empty input".
-    Otherwise returns an iterator that lazily drains the queue.
-
-    *state.done* is set to ``True`` once ``_DONE`` has been consumed
-    (immediately for ``None``/empty-input cases, or lazily once the
-    returned iterator is exhausted).
-    """
-    first = q.get()
-
-    # Original input was None.
-    if first is _NONE_INPUT:
-        # Consume the trailing _DONE.
-        q.get()  # _DONE
-        state.done = True
-        return None
-
-    # Empty input (just _DONE, no data items).
-    if first is _DONE:
-        state.done = True
-        return iter(())  # empty iterator, not None
-
-    # Normal: chain the first item with the rest of the queue.
-    def _iter() -> Iterator[str]:
-        yield first
-        while True:
-            item = q.get()
-            if item is _DONE:
-                state.done = True
-                return
-            if item is _NONE_INPUT:
-                continue
-            yield item
-
-    return _iter()
+def _tracked_queue_iter(q: Queue[Any], state: _QueueDrainState) -> Iterator[str]:
+    """Like ``_queue_iter`` but sets *state.done* when ``_DONE`` is consumed."""
+    while True:
+        item = q.get()
+        if item is _DONE:
+            state.done = True
+            return
+        yield item
 
 
 def _drain_queue(q: Queue[Any], *, already_done: bool = False) -> None:
@@ -236,46 +317,39 @@ def _drain_queue(q: Queue[Any], *, already_done: bool = False) -> None:
 class PathHandler:
     """Unified path handler for local and remote filesystems via UPath.
 
-    Implements ``StreamingHandler`` — file reads yield lines lazily and
-    writes stream items to disk as they arrive.
+    Implements ``Source`` (read a file), ``Transform`` (write to file and
+    pass data through), and ``Sink`` (write to file, discard data).
     """
 
     def __init__(self, path: str) -> None:
         self.upath = UPath(path)
 
-    # -- batch (Handler) ---------------------------------------------------
+    # -- Source ------------------------------------------------------------
 
-    def process(self, input_data: Iterable[str] | None) -> Iterable[str]:
-        if input_data is not None:
-            self.write(input_data)
-            return input_data
-        else:
-            return self.read()
+    def process_source(self) -> Iterable[str]:
+        """Read lines from the file.
 
-    # -- streaming (StreamingHandler) --------------------------------------
-
-    def process_stream(self, input_stream: Iterable[str] | None) -> Iterator[str]:
-        if input_stream is not None:
-            yield from self._write_stream(input_stream)
-        else:
-            yield from self._read_stream()
-
-    def _write_stream(self, data: Iterable[str]) -> Iterator[str]:
-        """Write items to the file, yielding each item as pass-through."""
-        with self.upath.open("w") as file:
-            for line in data:
-                file.write(line + "\n")
-                yield line
-
-    def _read_stream(self) -> Iterator[str]:
-        """Yield lines from the file one at a time.
-
-        Lines include trailing newlines to match the batch ``read()`` output
-        (``file.readlines()``), ensuring that pipelines produce identical
-        results regardless of sync vs parallel mode.
+        Returns a generator so items stream lazily in parallel mode.
         """
         with self.upath.open("r") as file:
             yield from file
+
+    # -- Transform ---------------------------------------------------------
+
+    def process_transform(self, input_data: Iterable[str]) -> Iterable[str]:
+        """Write input to file and pass each item through."""
+        with self.upath.open("w") as file:
+            for line in input_data:
+                file.write(line + "\n")
+                yield line
+
+    # -- Sink --------------------------------------------------------------
+
+    def process_sink(self, input_data: Iterable[str]) -> None:
+        """Write input to file (final stage, no passthrough)."""
+        with self.upath.open("w") as file:
+            for line in input_data:
+                file.write(line + "\n")
 
     # -- legacy convenience methods ----------------------------------------
 
@@ -292,30 +366,23 @@ class PathHandler:
 class ShellCommandHandler:
     """Runs a shell command, piping data through stdin/stdout.
 
-    Implements ``StreamingHandler`` — stdin is fed from the input stream
+    Implements ``Transform`` — stdin is fed from the input iterable
     via a writer thread, and stdout lines are yielded as they arrive.
-    The shell command itself decides how much to buffer (e.g. ``grep``
-    streams line-by-line, ``sort`` buffers until EOF).
     """
 
     def __init__(self, command: str) -> None:
         self.command = command
 
-    # -- batch (Handler) ---------------------------------------------------
+    # -- Transform ---------------------------------------------------------
 
-    def process(self, input_data: Iterable[str] | None) -> Iterable[str]:
-        if input_data is not None:
-            input_string = "\n".join(input_data)
-            return [self._run_command(input_string)]
-        else:
-            return []
+    def process_transform(self, input_data: Iterable[str]) -> Iterable[str]:
+        """Pipe *input_data* through the shell command, yielding stdout lines.
 
-    # -- streaming (StreamingHandler) --------------------------------------
-
-    def process_stream(self, input_stream: Iterable[str] | None) -> Iterator[str]:
-        if input_stream is None:
-            return
-
+        A writer thread feeds stdin so that the command can begin producing
+        output before all input has been consumed (true streaming for
+        commands like ``grep``).  Commands that buffer (like ``sort``)
+        naturally hold output until EOF on stdin.
+        """
         proc = subprocess.Popen(
             self.command,
             shell=True,
@@ -331,12 +398,11 @@ class ShellCommandHandler:
             nonlocal writer_error
             try:
                 assert proc.stdin is not None
-                for item in input_stream:
+                for item in input_data:
                     proc.stdin.write((item + "\n").encode())
                 proc.stdin.close()
             except BaseException as exc:
                 writer_error = exc
-                # Still close stdin so the process doesn't hang.
                 if proc.stdin is not None:
                     with contextlib.suppress(OSError):
                         proc.stdin.close()
@@ -362,7 +428,7 @@ class ShellCommandHandler:
             stderr = proc.stderr.read().decode()
             raise RuntimeError(f"Command failed with error: {stderr}")
 
-    # -- legacy helper (used by batch process) -----------------------------
+    # -- legacy helper used by tests ---------------------------------------
 
     def _run_command(self, input_string: str) -> str:
         process = subprocess.Popen(
@@ -381,9 +447,8 @@ class ShellCommandHandler:
 class SQLAlchemyHandler:
     """Queries all rows from a SQLAlchemy model and formats them as strings.
 
-    Implements ``StreamingHandler`` — uses ``yield_per()`` to fetch rows
-    in chunks from the database, yielding formatted strings one at a time
-    instead of materialising the entire result set in memory.
+    Implements ``Source`` — uses ``yield_per()`` to fetch rows in chunks,
+    yielding formatted strings one at a time for natural streaming.
     """
 
     _YIELD_PER_CHUNK = 100
@@ -392,19 +457,9 @@ class SQLAlchemyHandler:
         self.model = model
         self.session_factory = session_factory
 
-    # -- batch (Handler) ---------------------------------------------------
+    # -- Source ------------------------------------------------------------
 
-    def process(self, input_data: Iterable[Any] | None) -> Iterable[str]:
-        session = self.session_factory()
-        try:
-            records = session.query(self.model).all()
-            return [f"{record.id}\t{record.data}" for record in records]  # type: ignore[attr-defined]
-        finally:
-            session.close()
-
-    # -- streaming (StreamingHandler) --------------------------------------
-
-    def process_stream(self, input_stream: Iterable[str] | None) -> Iterator[str]:
+    def process_source(self) -> Iterable[str]:
         """Yield formatted rows using chunked fetching via ``yield_per``."""
         session = self.session_factory()
         try:
@@ -415,40 +470,98 @@ class SQLAlchemyHandler:
             session.close()
 
 
-class _CallableHandler:
-    """Wraps a plain callable so it conforms to the Handler protocol."""
+# ---------------------------------------------------------------------------
+# Callable handler wrappers (inferred from function signature)
+# ---------------------------------------------------------------------------
+
+
+def _infer_callable_role(func: Any) -> _Role:
+    """Inspect *func*'s type hints to determine its pipeline role.
+
+    Rules:
+    - No parameters (or only ``self``) and returns something → Source
+    - Accepts an input parameter and returns ``None`` → Sink
+    - Accepts an input parameter and returns something → Transform (default)
+    """
+    try:
+        hints = get_type_hints(func)
+    except Exception:
+        hints = {}
+
+    sig = inspect.signature(func)
+    params = [
+        p
+        for p in sig.parameters.values()
+        if p.name != "self" and p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD)
+    ]
+
+    has_input = len(params) > 0
+    return_hint = hints.get("return", inspect.Parameter.empty)
+
+    if not has_input:
+        return _Role.SOURCE
+
+    if return_hint is type(None):
+        return _Role.SINK
+
+    return _Role.TRANSFORM
+
+
+class _CallableSource:
+    """Wraps a no-argument callable as a ``Source``."""
 
     def __init__(self, func: Any) -> None:
         self.func = func
 
-    def process(self, input_data: Iterable[str] | None) -> Iterable[str]:
+    def process_source(self) -> Iterable[str]:
+        result: Iterable[str] = self.func()
+        return result
+
+
+class _CallableTransform:
+    """Wraps a callable as a ``Transform``."""
+
+    def __init__(self, func: Any) -> None:
+        self.func = func
+
+    def process_transform(self, input_data: Iterable[str]) -> Iterable[str]:
         result: Iterable[str] = self.func(input_data)
         return result
+
+
+class _CallableSink:
+    """Wraps a callable that returns ``None`` as a ``Sink``."""
+
+    def __init__(self, func: Any) -> None:
+        self.func = func
+
+    def process_sink(self, input_data: Iterable[str]) -> None:
+        self.func(input_data)
+
+
+def _wrap_callable(func: Any) -> _CallableSource | _CallableTransform | _CallableSink:
+    """Create the appropriate callable wrapper based on signature inference."""
+    role = _infer_callable_role(func)
+    if role is _Role.SOURCE:
+        return _CallableSource(func)
+    if role is _Role.SINK:
+        return _CallableSink(func)
+    return _CallableTransform(func)
 
 
 class TeeHandler:
     """Passes input through unchanged while also running a side pipeline.
 
-    In parallel mode the side pipeline executes concurrently in a thread.
+    Implements ``Transform`` — materialises input so both the main
+    passthrough and side pipeline can iterate independently.  In the
+    streaming pipeline the stage thread provides natural concurrency.
     """
 
     def __init__(self, pipeline: Slonk) -> None:
         self.pipeline = pipeline
 
-    def process(self, input_data: Iterable[str] | None) -> Iterable[str]:
-        """Synchronous: run side pipeline inline."""
-        results: list[str] = []
-        if input_data is not None:
-            results.extend(input_data)
-            results.extend(self.pipeline.run_sync(input_data))
-        return results
-
-    def process_parallel(self, input_data: Iterable[str] | None) -> Iterable[str]:
-        """Parallel: run the side pipeline concurrently in a thread."""
-        if input_data is None:
-            return []
-
-        # Materialise so both branches can iterate independently.
+    def process_transform(self, input_data: Iterable[str]) -> Iterable[str]:
+        """Run side pipeline and return original data + side results."""
         data = list(input_data)
 
         side_result: list[str] = []
@@ -481,6 +594,8 @@ class TeeHandler:
 class _ParallelHandler:
     """Splits input into chunks and processes them across a pool of workers.
 
+    Implements ``Transform``.
+
     On free-threaded Python a ``ThreadPoolExecutor`` is used (no serialisation
     overhead).  On standard Python a ``ProcessPoolExecutor`` is used with
     ``cloudpickle`` for serialising the callable.
@@ -496,10 +611,7 @@ class _ParallelHandler:
         self.workers = workers
         self.chunk_size = chunk_size
 
-    def process(self, input_data: Iterable[str] | None) -> Iterable[str]:
-        if input_data is None:
-            return self.func(None)
-
+    def process_transform(self, input_data: Iterable[str]) -> Iterable[str]:
         items = list(input_data)
         if not items:
             return self.func([])
@@ -510,7 +622,6 @@ class _ParallelHandler:
         ]
 
         if len(chunks) == 1:
-            # Not worth parallelising a single chunk.
             return self.func(items)
 
         if _is_free_threaded():
@@ -526,7 +637,6 @@ class _ParallelHandler:
         return results
 
     def _run_multiprocess(self, chunks: list[list[str]]) -> list[str]:
-        # Serialise the callable with cloudpickle so that lambdas/closures work.
         pickled_func = cloudpickle.dumps(self.func)
 
         results: list[str] = []
@@ -576,9 +686,11 @@ class _StreamingPipeline:
     def __init__(
         self,
         stages: list[StageType],
+        roles: list[_Role],
         max_queue_size: int = _DEFAULT_MAX_QUEUE_SIZE,
     ) -> None:
         self.stages = stages
+        self.roles = roles
         self.max_queue_size = max_queue_size
 
     def execute(self, input_data: Iterable[Any] | None) -> list[str]:
@@ -600,7 +712,7 @@ class _StreamingPipeline:
         for i, stage in enumerate(self.stages):
             t = threading.Thread(
                 target=self._run_stage,
-                args=(stage, queues[i], queues[i + 1], errors, lock),
+                args=(stage, self.roles[i], queues[i], queues[i + 1], errors, lock),
                 daemon=True,
             )
             threads.append(t)
@@ -610,8 +722,6 @@ class _StreamingPipeline:
         if input_data is not None:
             for item in input_data:
                 queues[0].put(item)
-        else:
-            queues[0].put(_NONE_INPUT)
         queues[0].put(_DONE)
 
         # Drain the final output queue.
@@ -635,6 +745,7 @@ class _StreamingPipeline:
     @staticmethod
     def _run_stage(
         stage: StageType,
+        role: _Role,
         in_q: Queue[Any],
         out_q: Queue[Any],
         errors: list[BaseException],
@@ -642,47 +753,47 @@ class _StreamingPipeline:
     ) -> None:
         """Worker: read from *in_q*, run the stage, push results to *out_q*.
 
-        Dispatch order:
-
-        1. ``StreamingHandler`` — the stage receives a lazy iterator (or
-           ``None``) over the input queue and yields results one at a
-           time.  This is the true streaming path.
-        2. ``TeeHandler`` — special handling for concurrent side-pipelines.
-        3. ``Slonk`` (sub-pipeline) — runs synchronously on the
-           materialised input.
-        4. Any other ``Handler`` — batch: materialise input, call
-           ``process()``, iterate the result (generators stream naturally).
+        Dispatch is based on the pre-computed *role*:
+        - SOURCE: ignore input queue (drain it), call ``process_source()``.
+        - TRANSFORM: pass a lazy queue iterator to ``process_transform()``.
+        - SINK: pass a lazy queue iterator to ``process_sink()``.
         """
-        # Shared flag — set to True once _DONE has been consumed from in_q,
-        # either eagerly (batch path) or lazily (streaming iterator,
-        # possibly in a child thread like ShellCommandHandler's writer).
         drain_state = _QueueDrainState()
         try:
-            if isinstance(stage, StreamingHandler):
-                # True streaming: pass None or a lazy queue iterator.
-                input_stream = _queue_to_stream_input(in_q, drain_state)
-                for item in stage.process_stream(input_stream):
-                    out_q.put(item)
-            else:
-                # Batch path: materialise all input from the queue first.
-                items: list[Any] = list(_queue_iter(in_q))
-                drain_state.done = True  # _queue_iter consumed through _DONE
-                input_data: list[Any] | None = items or None
-
-                if isinstance(stage, Slonk):
-                    result = stage.run_sync(input_data)
-                elif isinstance(stage, TeeHandler):
-                    result = stage.process_parallel(input_data)
-                else:
-                    result = stage.process(input_data)
-
+            if role is _Role.SOURCE:
+                # Drain the input queue (contains just _DONE, or seed data
+                # that should not be here — validation prevents this).
+                for _ in _tracked_queue_iter(in_q, drain_state):
+                    pass  # discard
+                assert isinstance(stage, Source)
+                result = stage.process_source()
                 if result is not None:
-                    for r in result:
-                        out_q.put(r)
+                    for item in result:
+                        out_q.put(item)
+
+            elif role is _Role.TRANSFORM:
+                input_stream = _tracked_queue_iter(in_q, drain_state)
+                if isinstance(stage, Slonk):
+                    # Sub-pipelines run synchronously on materialised input.
+                    items = list(input_stream)
+                    drain_state.done = True
+                    result = stage.run_sync(items or None)
+                    if result is not None:
+                        for r in result:
+                            out_q.put(r)
+                else:
+                    assert isinstance(stage, Transform)
+                    result = stage.process_transform(input_stream)
+                    if result is not None:
+                        for item in result:
+                            out_q.put(item)
+
+            elif role is _Role.SINK:
+                input_stream = _tracked_queue_iter(in_q, drain_state)
+                assert isinstance(stage, Sink)
+                stage.process_sink(input_stream)
+
         except BaseException as exc:
-            # Drain remaining input so upstream stages don't block forever
-            # on a full queue — but only if we haven't already consumed
-            # everything (otherwise we'd block on an empty queue).
             _drain_queue(in_q, already_done=drain_state.done)
             with lock:
                 errors.append(exc)
@@ -694,8 +805,6 @@ class _StreamingPipeline:
 # Core pipeline
 # ---------------------------------------------------------------------------
 
-StageType = Union[Handler, "Slonk"]
-
 
 class Slonk:
     def __init__(self, session_factory: sessionmaker[Session] | None = None) -> None:
@@ -704,10 +813,10 @@ class Slonk:
 
     def __or__(
         self,
-        other: str | Slonk | type[Base] | Handler | _ParallelHandler | Any,
+        other: str | Slonk | type[Base] | _ParallelHandler | Any,
     ) -> Slonk:
         if isinstance(other, _ParallelHandler):
-            self.stages.append(other)  # type: ignore[arg-type]
+            self.stages.append(other)  # type: ignore[arg-append]
         elif isinstance(other, str):
             if self._is_path(other):
                 self.stages.append(PathHandler(other))
@@ -723,7 +832,7 @@ class Slonk:
                 )
             self.stages.append(SQLAlchemyHandler(other, self.session_factory))
         elif callable(other):
-            self.stages.append(_CallableHandler(other))
+            self.stages.append(_wrap_callable(other))
         else:
             raise TypeError(f"Unsupported type: {type(other)}")
         return self
@@ -761,14 +870,32 @@ class Slonk:
 
     def run_sync(self, input_data: Iterable[Any] | None = None) -> Iterable[str]:
         """Run the pipeline sequentially — each stage blocks until complete."""
+        if not self.stages:
+            return list(input_data) if input_data is not None else []
+
+        roles = _compute_roles(self.stages, has_seed=input_data is not None)
         output: Any = input_data
-        for stage in self.stages:
-            if isinstance(stage, Slonk):
-                output = stage.run_sync(output)
-            elif isinstance(stage, TeeHandler):
-                output = stage.process(output)
-            else:
-                output = stage.process(output)
+
+        for stage, role in zip(self.stages, roles, strict=True):
+            if role is _Role.SOURCE:
+                if isinstance(stage, Source):
+                    output = stage.process_source()
+                else:
+                    raise TypeError(f"{type(stage).__name__} does not implement Source")
+            elif role is _Role.TRANSFORM:
+                if isinstance(stage, Slonk):
+                    output = stage.run_sync(output)
+                elif isinstance(stage, Transform):
+                    output = stage.process_transform(output)
+                else:
+                    raise TypeError(f"{type(stage).__name__} does not implement Transform")
+            elif role is _Role.SINK:
+                if isinstance(stage, Sink):
+                    stage.process_sink(output)
+                    output = []
+                else:
+                    raise TypeError(f"{type(stage).__name__} does not implement Sink")
+
         return output if output is not None else []
 
     def run_parallel(
@@ -783,7 +910,8 @@ class Slonk:
         provide backpressure.  ``TeeHandler`` side-pipelines execute
         concurrently.
         """
-        sp = _StreamingPipeline(self.stages, max_queue_size=max_queue_size)
+        roles = _compute_roles(self.stages, has_seed=input_data is not None)
+        sp = _StreamingPipeline(self.stages, roles, max_queue_size=max_queue_size)
         return sp.execute(input_data)
 
     # ------------------------------------------------------------------

@@ -16,7 +16,7 @@ class TestRealWorldScenarios:
     def test_data_transformation_pipeline(self, run_pipeline: PipelineRunner) -> None:
         """Test a typical data transformation pipeline."""
 
-        def parse_csv_line(data: list[str] | None) -> list[str]:
+        def parse_csv_line(data: list[str]) -> list[str]:
             """Simulate parsing CSV data."""
             if not data:
                 return []
@@ -29,7 +29,7 @@ class TestRealWorldScenarios:
                     result.append(line.strip())
             return result
 
-        def filter_valid_records(data: list[str] | None) -> list[str]:
+        def filter_valid_records(data: list[str]) -> list[str]:
             """Filter out empty or invalid records."""
             if not data:
                 return []
@@ -93,7 +93,7 @@ class TestRealWorldScenarios:
             with open(source_file, "w") as f:
                 f.write("Important data\nLine 2\nLine 3\n")
 
-            def copy_file(data: list[str] | None) -> list[str]:
+            def copy_file(data: list[str]) -> list[str]:
                 """Custom copy function that returns the data."""
                 if data:
                     # Write to backup file
@@ -122,18 +122,18 @@ class TestRealWorldScenarios:
     def test_data_aggregation_pipeline(self, run_pipeline: PipelineRunner) -> None:
         """Test data aggregation from multiple sources."""
 
-        def generate_numbers(data: object) -> list[str]:
+        def generate_numbers() -> list[str]:
             """Generate a sequence of numbers."""
             return [str(i) for i in range(1, 6)]  # 1,2,3,4,5
 
-        def calculate_sum(data: list[str] | None) -> list[str]:
+        def calculate_sum(data: list[str]) -> list[str]:
             """Calculate sum of numbers."""
             if not data:
                 return []
             total = sum(int(line.strip()) for line in data if line.strip().isdigit())
             return [f"Sum: {total}"]
 
-        def calculate_average(data: list[str] | None) -> list[str]:
+        def calculate_average(data: list[str]) -> list[str]:
             """Calculate average of numbers."""
             if not data:
                 return []
@@ -178,7 +178,7 @@ class TestRealWorldScenarios:
                 for line in config_content:
                     f.write(line + "\n")
 
-            def extract_database_config(data: list[str] | None) -> list[str]:
+            def extract_database_config(data: list[str]) -> list[str]:
                 """Extract database configuration."""
                 if not data:
                     return []
@@ -211,7 +211,7 @@ class TestRealWorldScenarios:
     def test_text_analysis_pipeline(self, run_pipeline: PipelineRunner) -> None:
         """Test text analysis and word counting."""
 
-        def tokenize_words(data: list[str] | None) -> list[str]:
+        def tokenize_words(data: list[str]) -> list[str]:
             """Split text into individual words."""
             if not data:
                 return []
@@ -222,7 +222,7 @@ class TestRealWorldScenarios:
                 words.extend(line.strip().split())
             return words
 
-        def count_word_lengths(data: list[str] | None) -> list[str]:
+        def count_word_lengths(data: list[str]) -> list[str]:
             """Count words by length."""
             if not data:
                 return []
@@ -259,7 +259,7 @@ class TestPerformanceScenarios:
     def test_large_dataset_processing(self, run_pipeline: PipelineRunner) -> None:
         """Test processing larger datasets efficiently."""
 
-        def process_batch(data: list[str] | None) -> list[str]:
+        def process_batch(data: list[str]) -> list[str]:
             """Process data in batches."""
             if not data:
                 return []
@@ -280,7 +280,7 @@ class TestPerformanceScenarios:
     def test_streaming_data_simulation(self, run_pipeline: PipelineRunner) -> None:
         """Test handling streaming-like data processing."""
 
-        def process_stream_chunk(data: list[str] | None) -> list[str]:
+        def process_stream_chunk(data: list[str]) -> list[str]:
             """Process data as if it's streaming."""
             if not data:
                 return []
@@ -293,12 +293,13 @@ class TestPerformanceScenarios:
 
             return processed
 
-        def aggregate_results(data: list[str] | None) -> list[str]:
+        def aggregate_results(data: list[str]) -> list[str]:
             """Aggregate processed results."""
-            if not data:
+            items = list(data)
+            if not items:
                 return []
 
-            return [f"Total processed items: {len(data)}"]
+            return [f"Total processed items: {len(items)}"]
 
         slonk = Slonk() | process_stream_chunk | aggregate_results
 
