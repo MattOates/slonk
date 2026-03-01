@@ -7,7 +7,11 @@ building and running typed data pipelines.  Stages are composed using the
 It also provides:
 
 * :class:`TeeHandler` — fork data to a side-pipeline while passing it through.
+* :class:`MergeHandler` — merge upstream data with sub-pipeline outputs (interleaved).
+* :class:`CatHandler` — concatenate upstream data with sub-pipeline outputs (ordered).
 * :func:`tee` — convenience factory that creates a ``TeeHandler``-bearing pipeline.
+* :func:`merge` — convenience factory that creates a ``MergeHandler``-bearing pipeline.
+* :func:`cat` — convenience factory that creates a ``CatHandler``-bearing pipeline.
 * :func:`_compute_roles` — assign :class:`~slonk.roles._Role` to each stage.
 
 Examples:
@@ -198,6 +202,124 @@ class TeeHandler(SlonkBase):
         results: list[str] = list(data)
         results.extend(side_result)
         return results
+
+
+class MergeHandler(SlonkBase):
+    """Merge upstream data with output from sub-pipelines concurrently.
+
+    Implements :class:`~slonk.roles.Transform` — runs each sub-pipeline
+    in its own thread, yielding items from any source as soon as they are
+    available (interleaved / non-deterministic order).
+
+    Upstream data is treated as the first stream; sub-pipeline outputs
+    are additional streams.  All items are merged via a shared
+    :class:`queue.Queue` for natural backpressure.
+
+    Args:
+        pipelines: One or more :class:`Slonk` sub-pipelines whose output
+            should be merged with upstream data.
+    """
+
+    def __init__(self, *pipelines: Slonk) -> None:
+        self.pipelines: tuple[Slonk, ...] = pipelines
+
+    def process_transform(self, input_data: Iterable[str]) -> Iterable[str]:
+        """Merge upstream data with sub-pipeline outputs concurrently.
+
+        Each producer (upstream + N sub-pipelines) pushes items into a
+        shared queue.  Items are yielded as soon as any producer emits
+        them.  A sentinel per producer signals completion.
+
+        Args:
+            input_data: Items from the upstream stage.
+
+        Yields:
+            Items from upstream and all sub-pipelines, interleaved.
+
+        Raises:
+            Exception: Re-raises the first error from any producer.
+        """
+        import queue as _queue_mod
+
+        n_producers = 1 + len(self.pipelines)
+        q: _queue_mod.Queue[object] = _queue_mod.Queue(maxsize=_DEFAULT_MAX_QUEUE_SIZE)
+        errors: list[BaseException] = []
+        lock = threading.Lock()
+        done = object()  # local sentinel
+
+        def _push_upstream() -> None:
+            try:
+                for item in input_data:
+                    q.put(item)
+            except BaseException as exc:
+                with lock:
+                    errors.append(exc)
+            finally:
+                q.put(done)
+
+        def _push_pipeline(pipeline: Slonk) -> None:
+            try:
+                for item in pipeline.run_sync():
+                    q.put(item)
+            except BaseException as exc:
+                with lock:
+                    errors.append(exc)
+            finally:
+                q.put(done)
+
+        threads: list[threading.Thread] = []
+        t = threading.Thread(target=_push_upstream, daemon=True)
+        threads.append(t)
+        t.start()
+
+        for p in self.pipelines:
+            t = threading.Thread(target=_push_pipeline, args=(p,), daemon=True)
+            threads.append(t)
+            t.start()
+
+        done_count = 0
+        while done_count < n_producers:
+            item = q.get()
+            if item is done:
+                done_count += 1
+            else:
+                yield item  # type: ignore[misc]
+
+        for t in threads:
+            t.join()
+
+        if errors:
+            raise errors[0]
+
+
+class CatHandler(SlonkBase):
+    """Concatenate upstream data with output from sub-pipelines in order.
+
+    Implements :class:`~slonk.roles.Transform` — yields all upstream
+    items first, then all items from each sub-pipeline in the order
+    they were listed.  Deterministic ordering is guaranteed.
+
+    Args:
+        pipelines: One or more :class:`Slonk` sub-pipelines whose output
+            should be concatenated after upstream data.
+    """
+
+    def __init__(self, *pipelines: Slonk) -> None:
+        self.pipelines: tuple[Slonk, ...] = pipelines
+
+    def process_transform(self, input_data: Iterable[str]) -> Iterable[str]:
+        """Yield upstream data followed by each sub-pipeline's output in order.
+
+        Args:
+            input_data: Items from the upstream stage.
+
+        Yields:
+            All upstream items, then all items from each sub-pipeline
+            sequentially.
+        """
+        yield from input_data
+        for pipeline in self.pipelines:
+            yield from pipeline.run_sync()
 
 
 class Slonk:
@@ -635,6 +757,38 @@ class Slonk:
         self.stages.append(tee_stage)
         return self
 
+    def merge(self, *pipelines: Slonk) -> Slonk:
+        """Merge upstream data with output from sub-pipelines concurrently.
+
+        Items from all sources are interleaved as they become available
+        (non-deterministic order).  Each sub-pipeline runs in its own
+        thread for maximum throughput.
+
+        Args:
+            pipelines: One or more :class:`Slonk` sub-pipelines.
+
+        Returns:
+            ``self`` for fluent chaining.
+        """
+        self.stages.append(MergeHandler(*pipelines))
+        return self
+
+    def cat(self, *pipelines: Slonk) -> Slonk:
+        """Concatenate upstream data with output from sub-pipelines in order.
+
+        All upstream items are yielded first, then all items from each
+        sub-pipeline in the order they were listed.  Deterministic
+        ordering is guaranteed.
+
+        Args:
+            pipelines: One or more :class:`Slonk` sub-pipelines.
+
+        Returns:
+            ``self`` for fluent chaining.
+        """
+        self.stages.append(CatHandler(*pipelines))
+        return self
+
 
 def tee(pipeline: Slonk) -> Slonk:
     """Convenience factory: create a new :class:`Slonk` with a tee stage.
@@ -649,4 +803,38 @@ def tee(pipeline: Slonk) -> Slonk:
     """
     s = Slonk()
     s.tee(pipeline)
+    return s
+
+
+def merge(*pipelines: Slonk) -> Slonk:
+    """Convenience factory: create a new :class:`Slonk` with a merge stage.
+
+    Equivalent to ``Slonk().merge(*pipelines)``.
+
+    Args:
+        pipelines: Sub-pipelines whose output should be merged with
+            upstream data (interleaved, non-deterministic order).
+
+    Returns:
+        A new :class:`Slonk` containing a single :class:`MergeHandler` stage.
+    """
+    s = Slonk()
+    s.merge(*pipelines)
+    return s
+
+
+def cat(*pipelines: Slonk) -> Slonk:
+    """Convenience factory: create a new :class:`Slonk` with a cat stage.
+
+    Equivalent to ``Slonk().cat(*pipelines)``.
+
+    Args:
+        pipelines: Sub-pipelines whose output should be concatenated
+            after upstream data (deterministic source order).
+
+    Returns:
+        A new :class:`Slonk` containing a single :class:`CatHandler` stage.
+    """
+    s = Slonk()
+    s.cat(*pipelines)
     return s

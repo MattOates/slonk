@@ -23,6 +23,8 @@ SQLAlchemy models, or custom handler objects.
 - **Built-in middleware** — `TimingMiddleware`, `LoggingMiddleware`, and
   `StatsMiddleware` ship out of the box.
 - **Tee/fork** — split data to side pipelines with `tee()`.
+- **Fan-in** — combine multiple sources with `merge()` (interleaved,
+  concurrent) or `cat()` (ordered, sequential).
 - **Data-parallel processing** — `parallel()` distributes work across a
   thread or process pool with `cloudpickle` serialisation.
 
@@ -171,6 +173,37 @@ class MyTransform(SlonkBase):
         for item in input_data:
             self.emit("processing", {"item": item})
             yield item.upper()
+```
+
+### Fan-in: merge and cat
+
+Combine data from multiple pipelines into one stream:
+
+```python
+from slonk import Slonk, merge, cat
+
+api  = Slonk() | (lambda: ["api_1", "api_2"])
+logs = Slonk() | (lambda: ["log_1", "log_2"])
+
+# merge — interleaved (non-deterministic order, concurrent)
+result = (
+    Slonk()
+    | (lambda: ["upstream"])
+    | merge(api, logs)
+).run()
+
+sorted(result)  # ['api_1', 'api_2', 'log_1', 'log_2', 'upstream']
+```
+
+```python
+# cat — ordered (deterministic, sequential)
+result = (
+    Slonk()
+    | (lambda: ["upstream"])
+    | cat(api, logs)
+).run()
+
+list(result)  # ['upstream', 'api_1', 'api_2', 'log_1', 'log_2']
 ```
 
 ## Sequential mode

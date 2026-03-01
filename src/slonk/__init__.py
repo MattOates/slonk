@@ -35,12 +35,23 @@ from slonk.handlers import (
     parallel,
 )
 from slonk.middleware import Middleware, _Event, _EventDispatcher, _EventType
-from slonk.pipeline import Slonk, TeeHandler, _compute_roles, tee
+from slonk.pipeline import (
+    CatHandler,
+    MergeHandler,
+    Slonk,
+    TeeHandler,
+    _compute_roles,
+    cat,
+    merge,
+    tee,
+)
 from slonk.roles import Sink, Source, StageType, Transform, _Role
 from slonk.streaming import _StreamingPipeline
 
 __all__ = [
+    "CatHandler",
     "LoggingMiddleware",
+    "MergeHandler",
     "Middleware",
     "PathHandler",
     "SQLAlchemyHandler",
@@ -65,6 +76,8 @@ __all__ = [
     "_StreamingPipeline",
     "_compute_roles",
     "_is_free_threaded",
+    "cat",
+    "merge",
     "parallel",
     "tee",
 ]

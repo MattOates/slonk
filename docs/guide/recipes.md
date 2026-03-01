@@ -98,6 +98,78 @@ pipeline = (
 pipeline.run()
 ```
 
+## Merge: combine multiple sources concurrently
+
+Pull data from several independent sources and merge them into a single
+stream.  Items arrive as soon as any source produces them
+(non-deterministic order):
+
+```python
+from slonk import Slonk, merge
+
+api_feed  = Slonk() | (lambda: ["api_event_1", "api_event_2"])
+log_feed  = Slonk() | "/var/log/app.log" | "grep ERROR"
+db_feed   = Slonk() | (lambda: ["db_row_1"])
+
+pipeline = (
+    Slonk()
+    | (lambda: ["local_item"])
+    | merge(api_feed, log_feed, db_feed)
+    | "sort"
+    | "./all_events.txt"
+)
+pipeline.run()
+```
+
+Each sub-pipeline runs in its own thread for maximum throughput.  The
+shared queue provides automatic backpressure if any producer is faster
+than the consumer.
+
+## Cat: concatenate sources in order
+
+When deterministic ordering matters, use `cat()` to yield all upstream
+items first, followed by each sub-pipeline in the order listed:
+
+```python
+from slonk import Slonk, cat
+
+header  = Slonk() | (lambda: ["id\tname"])
+records = Slonk() | (lambda: ["1\tAlice", "2\tBob"])
+footer  = Slonk() | (lambda: ["# end of report"])
+
+pipeline = (
+    Slonk()
+    | (lambda: ["# generated report"])
+    | cat(header, records, footer)
+    | "./report.tsv"
+)
+result = list(pipeline.run())
+# ['# generated report', 'id\tname', '1\tAlice', '2\tBob', '# end of report']
+```
+
+## Merge + Tee: fan-in with side effects
+
+Combine fan-in and fan-out for complex data flows — merge several feeds
+then tee a copy to an audit log:
+
+```python
+from slonk import Slonk, merge, tee
+
+feed_a = Slonk() | (lambda: ["event_a1", "event_a2"])
+feed_b = Slonk() | (lambda: ["event_b1"])
+audit  = Slonk() | "./audit.log"
+
+pipeline = (
+    Slonk()
+    | (lambda: ["primary"])
+    | merge(feed_a, feed_b)
+    | tee(audit)
+    | (lambda data: [e.upper() for e in data])
+    | "./processed.txt"
+)
+pipeline.run()
+```
+
 ## Data-parallel processing
 
 Distribute CPU-intensive work across threads (free-threaded Python) or

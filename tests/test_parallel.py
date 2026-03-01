@@ -22,6 +22,8 @@ from sqlalchemy.pool import StaticPool
 
 from helpers import TestBase, TestModel
 from slonk import (
+    CatHandler,
+    MergeHandler,
     PathHandler,
     ShellCommandHandler,
     Sink,
@@ -34,6 +36,8 @@ from slonk import (
     _compute_roles,
     _is_free_threaded,
     _StreamingPipeline,
+    cat,
+    merge,
     parallel,
 )
 
@@ -791,3 +795,146 @@ class TestGeneratorAutoStreaming:
         slonk = Slonk() | gen
         result = list(slonk.run_parallel(["a", "b", "c"]))
         assert result == ["A", "B", "C"]
+
+
+# ---------------------------------------------------------------------------
+# Merge and Cat in parallel mode
+# ---------------------------------------------------------------------------
+
+
+class TestMergeParallel:
+    """Tests for MergeHandler under parallel execution."""
+
+    @pytest.mark.parallel_only()
+    def test_merge_concurrent_sources_parallel(self) -> None:
+        """merge() combines upstream + sub-pipelines in parallel mode."""
+        source_a = Slonk() | (lambda: ["a1", "a2"])
+        source_b = Slonk() | (lambda: ["b1", "b2"])
+
+        pipeline = Slonk() | (lambda: ["up1"]) | merge(source_a, source_b)
+        result = sorted(pipeline.run_parallel())
+
+        assert result == ["a1", "a2", "b1", "b2", "up1"]
+
+    @pytest.mark.parallel_only()
+    def test_merge_into_downstream_sink(self) -> None:
+        """Merged data flows into a downstream shell sink."""
+        source_a = Slonk() | (lambda: ["hello"])
+        source_b = Slonk() | (lambda: ["world"])
+
+        pipeline = (
+            Slonk()
+            | (lambda: ["greetings"])
+            | merge(source_a, source_b)
+            | (lambda data: sorted(data))
+        )
+        result = list(pipeline.run_parallel())
+
+        assert result == ["greetings", "hello", "world"]
+
+    @pytest.mark.parallel_only()
+    def test_merge_many_sources(self) -> None:
+        """merge() handles many sub-pipelines."""
+
+        def make_source(n: int) -> Slonk:
+            return Slonk() | (lambda: [f"s{n}"])
+
+        sources = [make_source(i) for i in range(10)]
+
+        pipeline = Slonk() | (lambda: ["base"]) | merge(*sources)
+        result = sorted(pipeline.run_parallel())
+
+        expected = ["base"] + [f"s{i}" for i in range(10)]
+        assert result == sorted(expected)
+
+    @pytest.mark.parallel_only()
+    def test_merge_handler_is_transform_protocol(self) -> None:
+        """MergeHandler conforms to Transform protocol."""
+        handler = MergeHandler(Slonk() | (lambda: ["x"]))
+        assert isinstance(handler, Transform)
+
+    @pytest.mark.parallel_only()
+    def test_merge_sync_parallel_consistency(self) -> None:
+        """merge() produces the same items in sync and parallel modes."""
+
+        def build() -> Slonk:
+            return (
+                Slonk()
+                | (lambda: ["up"])
+                | merge(
+                    Slonk() | (lambda: ["a1", "a2"]),
+                    Slonk() | (lambda: ["b1", "b2"]),
+                )
+            )
+
+        sync_result = sorted(build().run_sync())
+        parallel_result = sorted(build().run_parallel())
+
+        assert sync_result == parallel_result
+
+
+class TestCatParallel:
+    """Tests for CatHandler under parallel execution."""
+
+    @pytest.mark.parallel_only()
+    def test_cat_preserves_order_parallel(self) -> None:
+        """cat() yields upstream first, then sub-pipelines in order (parallel mode)."""
+        source_a = Slonk() | (lambda: ["a1", "a2"])
+        source_b = Slonk() | (lambda: ["b1", "b2"])
+
+        pipeline = Slonk() | (lambda: ["up1", "up2"]) | cat(source_a, source_b)
+        result = list(pipeline.run_parallel())
+
+        assert result == ["up1", "up2", "a1", "a2", "b1", "b2"]
+
+    @pytest.mark.parallel_only()
+    def test_cat_into_downstream_transform(self) -> None:
+        """Concatenated data flows into a downstream transform."""
+        source = Slonk() | (lambda: ["world"])
+
+        pipeline = (
+            Slonk() | (lambda: ["hello"]) | cat(source) | (lambda data: [s.upper() for s in data])
+        )
+        result = list(pipeline.run_parallel())
+
+        assert result == ["HELLO", "WORLD"]
+
+    @pytest.mark.parallel_only()
+    def test_cat_many_sources(self) -> None:
+        """cat() handles many sub-pipelines in order."""
+
+        def make_source(n: int) -> Slonk:
+            return Slonk() | (lambda: [f"s{n}"])
+
+        sources = [make_source(i) for i in range(5)]
+
+        pipeline = Slonk() | (lambda: ["base"]) | cat(*sources)
+        result = list(pipeline.run_parallel())
+
+        expected = ["base"] + [f"s{i}" for i in range(5)]
+        assert result == expected
+
+    @pytest.mark.parallel_only()
+    def test_cat_handler_is_transform_protocol(self) -> None:
+        """CatHandler conforms to Transform protocol."""
+        handler = CatHandler(Slonk() | (lambda: ["x"]))
+        assert isinstance(handler, Transform)
+
+    @pytest.mark.parallel_only()
+    def test_cat_sync_parallel_consistency(self) -> None:
+        """cat() produces the same items and order in sync and parallel modes."""
+
+        def build() -> Slonk:
+            return (
+                Slonk()
+                | (lambda: ["up"])
+                | cat(
+                    Slonk() | (lambda: ["a1", "a2"]),
+                    Slonk() | (lambda: ["b1", "b2"]),
+                )
+            )
+
+        sync_result = list(build().run_sync())
+        parallel_result = list(build().run_parallel())
+
+        assert sync_result == parallel_result
