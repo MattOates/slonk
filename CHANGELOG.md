@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.3.0 (2026-03-01)
+
+### Features
+
+- Add merge() and cat() fan-in primitives for combining multiple data sources
+  ([`a18894e`](https://github.com/MattOates/slonk/commit/a18894eddacb1aaaff31d0b351350dbc9d020727))
+
+
 ## v0.2.0 (2026-03-01)
 
 ### Bug Fixes
