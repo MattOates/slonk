@@ -29,7 +29,7 @@ from slonk import (
 if TYPE_CHECKING:
     from conftest import PipelineRunner
 
-from helpers import TestBase, TestModel
+from helpers import ExampleBase, ExampleModel
 
 
 class TestPathHandler:
@@ -150,15 +150,15 @@ class TestSQLAlchemyHandler:
             connect_args={"check_same_thread": False},
             poolclass=StaticPool,
         )
-        TestBase.metadata.create_all(engine)
+        ExampleBase.metadata.create_all(engine)
         Session = sessionmaker(bind=engine)
 
         session = Session()
         session.add_all(
             [
-                TestModel(id="1", data="Hello World"),
-                TestModel(id="2", data="Goodbye World"),
-                TestModel(id="3", data="Test Data"),
+                ExampleModel(id="1", data="Hello World"),
+                ExampleModel(id="2", data="Goodbye World"),
+                ExampleModel(id="3", data="Test Data"),
             ]
         )
         session.commit()
@@ -167,11 +167,11 @@ class TestSQLAlchemyHandler:
         return Session
 
     def test_init(self, setup_db: sessionmaker) -> None:
-        handler = SQLAlchemyHandler(TestModel, setup_db)
-        assert handler.model == TestModel
+        handler = SQLAlchemyHandler(ExampleModel, setup_db)
+        assert handler.model == ExampleModel
 
     def test_process_source(self, setup_db: sessionmaker) -> None:
-        handler = SQLAlchemyHandler(TestModel, setup_db)
+        handler = SQLAlchemyHandler(ExampleModel, setup_db)
         result = list(handler.process_source())
 
         assert len(result) == 3
@@ -180,7 +180,7 @@ class TestSQLAlchemyHandler:
         assert "3\tTest Data" in result
 
     def test_process_transform_upserts_and_passes_through(self, setup_db: sessionmaker) -> None:
-        handler = SQLAlchemyHandler(TestModel, setup_db)
+        handler = SQLAlchemyHandler(ExampleModel, setup_db)
         new_data = ["4\tNew Item", "5\tAnother Item"]
 
         result = list(handler.process_transform(new_data))
@@ -194,7 +194,7 @@ class TestSQLAlchemyHandler:
         assert "5\tAnother Item" in source_result
 
     def test_process_transform_upserts_existing(self, setup_db: sessionmaker) -> None:
-        handler = SQLAlchemyHandler(TestModel, setup_db)
+        handler = SQLAlchemyHandler(ExampleModel, setup_db)
         # Upsert an existing row with new data
         updated_data = ["1\tUpdated Hello"]
 
@@ -206,7 +206,7 @@ class TestSQLAlchemyHandler:
         assert "1\tHello World" not in source_result
 
     def test_process_sink_writes_without_passthrough(self, setup_db: sessionmaker) -> None:
-        handler = SQLAlchemyHandler(TestModel, setup_db)
+        handler = SQLAlchemyHandler(ExampleModel, setup_db)
         new_data = ["10\tSink Item A", "11\tSink Item B"]
 
         result = handler.process_sink(new_data)
@@ -220,7 +220,7 @@ class TestSQLAlchemyHandler:
         assert "11\tSink Item B" in source_result
 
     def test_process_sink_upserts_existing(self, setup_db: sessionmaker) -> None:
-        handler = SQLAlchemyHandler(TestModel, setup_db)
+        handler = SQLAlchemyHandler(ExampleModel, setup_db)
         updated_data = ["2\tSink Updated"]
 
         handler.process_sink(updated_data)
@@ -230,7 +230,7 @@ class TestSQLAlchemyHandler:
         assert "2\tGoodbye World" not in source_result
 
     def test_parse_record_bad_format(self, setup_db: sessionmaker) -> None:
-        handler = SQLAlchemyHandler(TestModel, setup_db)
+        handler = SQLAlchemyHandler(ExampleModel, setup_db)
         with pytest.raises(ValueError, match="Expected"):
             handler._parse_record("no-tab-here")
 
@@ -342,13 +342,13 @@ class TestSlonk:
     def test_or_with_sqlalchemy_model_requires_session(self) -> None:
         slonk = Slonk()
         with pytest.raises(ValueError, match="session_factory"):
-            slonk | TestModel
+            slonk | ExampleModel
 
     def test_or_with_sqlalchemy_model(self) -> None:
         engine = create_engine("sqlite:///:memory:")
         Session = sessionmaker(bind=engine)
         slonk = Slonk(session_factory=Session)
-        result = slonk | TestModel
+        result = slonk | ExampleModel
 
         assert result is slonk
         assert len(slonk.stages) == 1
@@ -419,9 +419,9 @@ class TestRoleProtocols:
             connect_args={"check_same_thread": False},
             poolclass=StaticPool,
         )
-        TestBase.metadata.create_all(engine)
+        ExampleBase.metadata.create_all(engine)
         sf = sessionmaker(bind=engine)
-        handler = SQLAlchemyHandler(TestModel, sf)
+        handler = SQLAlchemyHandler(ExampleModel, sf)
         assert isinstance(handler, Source)
 
     def test_sqlalchemy_handler_is_transform(self) -> None:
@@ -430,9 +430,9 @@ class TestRoleProtocols:
             connect_args={"check_same_thread": False},
             poolclass=StaticPool,
         )
-        TestBase.metadata.create_all(engine)
+        ExampleBase.metadata.create_all(engine)
         sf = sessionmaker(bind=engine)
-        handler = SQLAlchemyHandler(TestModel, sf)
+        handler = SQLAlchemyHandler(ExampleModel, sf)
         assert isinstance(handler, Transform)
 
     def test_sqlalchemy_handler_is_sink(self) -> None:
@@ -441,9 +441,9 @@ class TestRoleProtocols:
             connect_args={"check_same_thread": False},
             poolclass=StaticPool,
         )
-        TestBase.metadata.create_all(engine)
+        ExampleBase.metadata.create_all(engine)
         sf = sessionmaker(bind=engine)
-        handler = SQLAlchemyHandler(TestModel, sf)
+        handler = SQLAlchemyHandler(ExampleModel, sf)
         assert isinstance(handler, Sink)
 
     def test_tee_handler_is_transform(self) -> None:
@@ -534,7 +534,7 @@ class TestIntegration:
             connect_args={"check_same_thread": False},
             poolclass=StaticPool,
         )
-        TestBase.metadata.create_all(engine)
+        ExampleBase.metadata.create_all(engine)
         return sessionmaker(bind=engine)
 
     def test_sql_to_shell_pipeline(
@@ -543,15 +543,15 @@ class TestIntegration:
         session = setup_test_db()
         session.add_all(
             [
-                TestModel(id="1", data="Hello World"),
-                TestModel(id="2", data="Goodbye World"),
-                TestModel(id="3", data="Hello Again"),
+                ExampleModel(id="1", data="Hello World"),
+                ExampleModel(id="2", data="Goodbye World"),
+                ExampleModel(id="3", data="Hello Again"),
             ]
         )
         session.commit()
         session.close()
 
-        slonk = Slonk(session_factory=setup_test_db) | TestModel | "grep Hello"
+        slonk = Slonk(session_factory=setup_test_db) | ExampleModel | "grep Hello"
         result = list(run_pipeline(slonk))
 
         output = "\n".join(result)
@@ -563,19 +563,19 @@ class TestIntegration:
         self, setup_test_db: sessionmaker, run_pipeline: PipelineRunner
     ) -> None:
         """SQLAlchemyHandler as Transform in the middle: upserts + passes through."""
-        TestBase.metadata.create_all(setup_test_db().get_bind())
+        ExampleBase.metadata.create_all(setup_test_db().get_bind())
 
         def generate_data(data: list[str]) -> list[str]:
             return ["100\tGenerated A", "101\tGenerated B"]
 
-        slonk = Slonk(session_factory=setup_test_db) | generate_data | TestModel | "cat"
+        slonk = Slonk(session_factory=setup_test_db) | generate_data | ExampleModel | "cat"
         result = list(run_pipeline(slonk, ["seed"]))
 
         assert "100\tGenerated A" in result
         assert "101\tGenerated B" in result
 
         # Verify the rows were actually written to the DB
-        handler = SQLAlchemyHandler(TestModel, setup_test_db)
+        handler = SQLAlchemyHandler(ExampleModel, setup_test_db)
         source_result = list(handler.process_source())
         assert "100\tGenerated A" in source_result
         assert "101\tGenerated B" in source_result
@@ -584,19 +584,19 @@ class TestIntegration:
         self, setup_test_db: sessionmaker, run_pipeline: PipelineRunner
     ) -> None:
         """SQLAlchemyHandler as Sink at end: bulk-writes, returns empty."""
-        TestBase.metadata.create_all(setup_test_db().get_bind())
+        ExampleBase.metadata.create_all(setup_test_db().get_bind())
 
         def generate_data(data: list[str]) -> list[str]:
             return ["200\tSink Write A", "201\tSink Write B"]
 
-        slonk = Slonk(session_factory=setup_test_db) | generate_data | TestModel
+        slonk = Slonk(session_factory=setup_test_db) | generate_data | ExampleModel
         result = list(run_pipeline(slonk, ["seed"]))
 
         # Sink returns empty
         assert result == []
 
         # Verify data was written
-        handler = SQLAlchemyHandler(TestModel, setup_test_db)
+        handler = SQLAlchemyHandler(ExampleModel, setup_test_db)
         source_result = list(handler.process_source())
         assert "200\tSink Write A" in source_result
         assert "201\tSink Write B" in source_result

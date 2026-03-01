@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from helpers import TestBase, TestModel  # noqa: F401 — re-exported for conftest consumers
+from helpers import ExampleBase, ExampleModel  # noqa: F401 — re-exported for conftest consumers
 from slonk import Slonk
 
 
