@@ -1,10 +1,10 @@
-import tempfile
 import os
+import tempfile
 from pathlib import Path
 
 import pytest
 
-from slonk import Slonk, LocalPathHandler, ShellCommandHandler
+from slonk import LocalPathHandler, ShellCommandHandler, Slonk
 
 
 class TestErrorHandling:
@@ -102,9 +102,7 @@ class TestEdgeCases:
         assert result[-1] == "line_999"
 
     def test_unicode_handling(self) -> None:
-        with tempfile.NamedTemporaryFile(
-            mode="w", delete=False, encoding="utf-8"
-        ) as tmp:
+        with tempfile.NamedTemporaryFile(mode="w", delete=False, encoding="utf-8") as tmp:
             tmp_path = tmp.name
 
         try:
@@ -149,10 +147,7 @@ class TestEdgeCases:
         # Test that the system handles binary-like data gracefully
         def binary_to_hex(data: list[str] | None) -> list[str]:
             return (
-                [
-                    item.encode().hex() if isinstance(item, str) else str(item)
-                    for item in data
-                ]
+                [item.encode().hex() if isinstance(item, str) else str(item) for item in data]
                 if data
                 else []
             )
@@ -185,16 +180,12 @@ class TestSlonkPipelineTypes:
         assert slonk._is_cloud_path("s3://bucket/key")
         assert slonk._is_cloud_path("gs://bucket/key")
         assert slonk._is_cloud_path("azure://container/blob")
-        assert slonk._is_cloud_path(
-            "wasb://container@account.blob.core.windows.net/blob"
-        )
+        assert slonk._is_cloud_path("wasb://container@account.blob.core.windows.net/blob")
 
         assert not slonk._is_cloud_path("/local/path")
         assert not slonk._is_cloud_path("./relative/path")
         assert not slonk._is_cloud_path("echo command")
-        assert not slonk._is_cloud_path(
-            "ftp://server/file"
-        )  # Not a supported cloud scheme
+        assert not slonk._is_cloud_path("ftp://server/file")  # Not a supported cloud scheme
 
     def test_callable_with_annotations(self) -> None:
         def annotated_func(data: list[str]) -> list[str]:

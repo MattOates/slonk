@@ -1,5 +1,5 @@
-import tempfile
 import os
+import tempfile
 
 from slonk import Slonk
 
@@ -98,9 +98,7 @@ class TestRealWorldScenarios:
                 return []
 
             # Pipeline: read source -> copy to backup -> verify
-            slonk = (
-                Slonk() | source_file | copy_file | f"diff {source_file} {backup_file}"
-            )
+            slonk = Slonk() | source_file | copy_file | f"diff {source_file} {backup_file}"
 
             result = list(slonk.run())
 
@@ -245,9 +243,7 @@ class TestRealWorldScenarios:
         # Should have counts for different word lengths
         assert len(result) > 0
         assert any("Length 3:" in line for line in result)  # "The", "fox", "dog", etc.
-        assert any(
-            "Length 4:" in line for line in result
-        )  # "over", "lazy", "test", etc.
+        assert any("Length 4:" in line for line in result)  # "over", "lazy", "test", etc.
 
 
 class TestPerformanceScenarios:

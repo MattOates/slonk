@@ -1,7 +1,8 @@
-from pathlib import Path
-from typing import Any, Iterable, Optional, Protocol, Union, runtime_checkable
-from urllib.parse import urlparse
 import subprocess
+from collections.abc import Iterable
+from pathlib import Path
+from typing import Any, Protocol, Union, runtime_checkable
+from urllib.parse import urlparse
 
 import cloudpathlib
 from sqlalchemy import Column, String, create_engine
@@ -20,16 +21,16 @@ class ExampleModel(Base):
 
 @runtime_checkable
 class Handler(Protocol):
-    def process(self, input_data: Optional[Iterable[str]]) -> Iterable[str]: ...
+    def process(self, input_data: Iterable[str] | None) -> Iterable[str]: ...
 
 
 # Define handlers
 class CloudPathHandler:
     def __init__(self, url: str) -> None:
         self.url = url
-        self.cloud_path = cloudpathlib.CloudPath(url)
+        self.cloud_path = cloudpathlib.CloudPath(url)  # type: ignore[abstract]
 
-    def process(self, input_data: Optional[Iterable[str]]) -> Iterable[str]:
+    def process(self, input_data: Iterable[str] | None) -> Iterable[str]:
         if input_data is not None:
             self.write(input_data)  # Write input data to the cloud path
             return input_data  # Return the input data for onward processing
@@ -50,7 +51,7 @@ class LocalPathHandler:
     def __init__(self, path: str) -> None:
         self.path = Path(path)
 
-    def process(self, input_data: Optional[Iterable[str]]) -> Iterable[str]:
+    def process(self, input_data: Iterable[str] | None) -> Iterable[str]:
         if input_data is not None:
             self.write(input_data)  # Write input data to the local path
             return input_data  # Return the input data for onward processing
@@ -71,7 +72,7 @@ class ShellCommandHandler:
     def __init__(self, command: str) -> None:
         self.command = command
 
-    def process(self, input_data: Optional[Iterable[str]]) -> Iterable[str]:
+    def process(self, input_data: Iterable[str] | None) -> Iterable[str]:
         if input_data is not None:
             input_string = "\n".join(input_data)
             return [self._run_command(input_string)]
@@ -93,17 +94,15 @@ class ShellCommandHandler:
 
 
 class SQLAlchemyHandler:
-    def __init__(
-        self, model: type[Base], session_factory: sessionmaker[Session]
-    ) -> None:
+    def __init__(self, model: type[Base], session_factory: sessionmaker[Session]) -> None:
         self.model = model
         self.session_factory = session_factory
 
-    def process(self, input_data: Optional[Iterable[Any]]) -> Iterable[str]:
+    def process(self, input_data: Iterable[Any] | None) -> Iterable[str]:
         session = self.session_factory()
         try:
             records = session.query(self.model).all()
-            return [f"{record.id}\t{record.data}" for record in records]
+            return [f"{record.id}\t{record.data}" for record in records]  # type: ignore[attr-defined]
         finally:
             session.close()
 
@@ -112,7 +111,7 @@ StageType = Union[Handler, "Slonk"]
 
 
 class Slonk:
-    def __init__(self, session_factory: Optional[sessionmaker[Session]] = None) -> None:
+    def __init__(self, session_factory: sessionmaker[Session] | None = None) -> None:
         self.stages: list[StageType] = []
         self.session_factory = session_factory
 
@@ -142,13 +141,10 @@ class Slonk:
             raise TypeError(f"Unsupported type: {type(other)}")
         return self
 
-    def run(self, input_data: Optional[Iterable[Any]] = None) -> Iterable[str]:
+    def run(self, input_data: Iterable[Any] | None = None) -> Iterable[str]:
         output: Any = input_data
         for stage in self.stages:
-            if isinstance(stage, Slonk):
-                output = stage.run(output)
-            else:
-                output = stage.process(output)
+            output = stage.run(output) if isinstance(stage, Slonk) else stage.process(output)
         return output if output is not None else []
 
     def _is_local_path(self, string: str) -> bool:
@@ -175,15 +171,16 @@ class _CallableHandler:
     def __init__(self, func: Any) -> None:
         self.func = func
 
-    def process(self, input_data: Optional[Iterable[str]]) -> Iterable[str]:
-        return self.func(input_data)
+    def process(self, input_data: Iterable[str] | None) -> Iterable[str]:
+        result: Iterable[str] = self.func(input_data)
+        return result
 
 
 class TeeHandler:
     def __init__(self, pipeline: Slonk) -> None:
         self.pipeline = pipeline
 
-    def process(self, input_data: Optional[Iterable[str]]) -> Iterable[str]:
+    def process(self, input_data: Iterable[str] | None) -> Iterable[str]:
         results: list[str] = []
         if input_data is not None:
             # Pass through the input data unchanged

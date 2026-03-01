@@ -1,20 +1,21 @@
-import pytest
-import tempfile
 import os
+import tempfile
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
+
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from slonk import (
-    LocalPathHandler,
-    ShellCommandHandler,
-    SQLAlchemyHandler,
-    Slonk,
-    TeeHandler,
-    tee,
     Base,
     ExampleModel,
+    LocalPathHandler,
+    ShellCommandHandler,
+    Slonk,
+    SQLAlchemyHandler,
+    TeeHandler,
+    tee,
 )
 
 
