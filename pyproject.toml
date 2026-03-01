@@ -6,7 +6,7 @@ authors = [
     { name = "Matt Oates", email = "mattoates+support@gmail.com" }
 ]
 dependencies = [
-    "cloudpathlib>=0.18.1",
+    "universal-pathlib>=0.3.10",
     "sqlalchemy>=2.0.32",
 ]
 readme = "README.md"
@@ -68,6 +68,3 @@ warn_unused_configs = true
 disallow_untyped_defs = true
 check_untyped_defs = true
 
-[[tool.mypy.overrides]]
-module = ["cloudpathlib.*"]
-ignore_missing_imports = true

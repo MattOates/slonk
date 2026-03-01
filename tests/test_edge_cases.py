@@ -4,17 +4,17 @@ from pathlib import Path
 
 import pytest
 
-from slonk import LocalPathHandler, ShellCommandHandler, Slonk
+from slonk import PathHandler, ShellCommandHandler, Slonk
 
 
 class TestErrorHandling:
-    def test_local_path_handler_file_not_found(self) -> None:
-        handler = LocalPathHandler("/nonexistent/path/file.txt")
+    def test_path_handler_file_not_found(self) -> None:
+        handler = PathHandler("/nonexistent/path/file.txt")
 
         with pytest.raises(FileNotFoundError):
             list(handler.read())
 
-    def test_local_path_handler_permission_error(self) -> None:
+    def test_path_handler_permission_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             test_file = os.path.join(tmpdir, "test.txt")
 
@@ -22,7 +22,7 @@ class TestErrorHandling:
             Path(test_file).touch()
             os.chmod(test_file, 0o444)  # read-only
 
-            handler = LocalPathHandler(test_file)
+            handler = PathHandler(test_file)
 
             # Writing should fail due to permissions
             with pytest.raises(PermissionError):
@@ -106,7 +106,7 @@ class TestEdgeCases:
             tmp_path = tmp.name
 
         try:
-            handler = LocalPathHandler(tmp_path)
+            handler = PathHandler(tmp_path)
             unicode_data = ["Hello 世界", "Café ☕", "🚀 Rocket"]
 
             handler.write(unicode_data)
@@ -160,32 +160,31 @@ class TestEdgeCases:
 
 
 class TestSlonkPipelineTypes:
-    def test_string_to_path_detection(self) -> None:
+    def test_path_detection(self) -> None:
         slonk = Slonk()
 
-        # Test various path formats
-        assert slonk._is_local_path("/absolute/path")
-        assert slonk._is_local_path("./relative/path")
-        assert slonk._is_local_path("../parent/path")
-        assert slonk._is_local_path("file:///absolute/path")
+        # Local path formats
+        assert slonk._is_path("/absolute/path")
+        assert slonk._is_path("./relative/path")
+        assert slonk._is_path("../parent/path")
+        assert slonk._is_path("file:///absolute/path")
 
-        assert not slonk._is_local_path("echo command")
-        assert not slonk._is_local_path("grep pattern")
-        assert not slonk._is_local_path("s3://bucket/key")
+        # Cloud/remote path formats
+        assert slonk._is_path("s3://bucket/key")
+        assert slonk._is_path("gs://bucket/key")
+        assert slonk._is_path("az://container/blob")
+        assert slonk._is_path("ftp://server/file")
+        assert slonk._is_path("sftp://server/file")
+        assert slonk._is_path("http://example.com/data.csv")
+        assert slonk._is_path("https://example.com/data.csv")
+        assert slonk._is_path("memory://some/path")
 
-    def test_cloud_path_detection(self) -> None:
-        slonk = Slonk()
+        # Not paths — shell commands
+        assert not slonk._is_path("echo command")
+        assert not slonk._is_path("grep pattern")
 
-        # Test various cloud path formats
-        assert slonk._is_cloud_path("s3://bucket/key")
-        assert slonk._is_cloud_path("gs://bucket/key")
-        assert slonk._is_cloud_path("azure://container/blob")
-        assert slonk._is_cloud_path("wasb://container@account.blob.core.windows.net/blob")
-
-        assert not slonk._is_cloud_path("/local/path")
-        assert not slonk._is_cloud_path("./relative/path")
-        assert not slonk._is_cloud_path("echo command")
-        assert not slonk._is_cloud_path("ftp://server/file")  # Not a supported cloud scheme
+        # Unknown URI schemes are not paths
+        assert not slonk._is_path("mailto://user@example.com")
 
     def test_callable_with_annotations(self) -> None:
         def annotated_func(data: list[str]) -> list[str]:

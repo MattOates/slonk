@@ -1,6 +1,5 @@
 import os
 import tempfile
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -10,7 +9,7 @@ from sqlalchemy.orm import sessionmaker
 from slonk import (
     Base,
     ExampleModel,
-    LocalPathHandler,
+    PathHandler,
     ShellCommandHandler,
     Slonk,
     SQLAlchemyHandler,
@@ -19,17 +18,17 @@ from slonk import (
 )
 
 
-class TestLocalPathHandler:
+class TestPathHandler:
     def test_init(self) -> None:
-        handler = LocalPathHandler("/tmp/test.txt")
-        assert handler.path == Path("/tmp/test.txt")
+        handler = PathHandler("/tmp/test.txt")
+        assert str(handler.upath) == "/tmp/test.txt"
 
     def test_write_and_read(self) -> None:
         with tempfile.NamedTemporaryFile(mode="w", delete=False) as tmp:
             tmp_path = tmp.name
 
         try:
-            handler = LocalPathHandler(tmp_path)
+            handler = PathHandler(tmp_path)
             test_data = ["line1", "line2", "line3"]
 
             # Test write
@@ -47,7 +46,7 @@ class TestLocalPathHandler:
             tmp_path = tmp.name
 
         try:
-            handler = LocalPathHandler(tmp_path)
+            handler = PathHandler(tmp_path)
             test_data = ["test", "data"]
 
             result = list(handler.process(test_data))
@@ -71,7 +70,7 @@ class TestLocalPathHandler:
             with open(tmp_path, "w") as f:
                 f.write("existing\ncontent\n")
 
-            handler = LocalPathHandler(tmp_path)
+            handler = PathHandler(tmp_path)
             result = list(handler.process(None))
 
             assert result == ["existing\n", "content\n"]
@@ -169,22 +168,23 @@ class TestSlonk:
         slonk = Slonk()
         assert slonk.stages == []
 
-    def test_is_local_path(self) -> None:
+    def test_is_path(self) -> None:
         slonk = Slonk()
-        assert slonk._is_local_path("/absolute/path")
-        assert slonk._is_local_path("./relative/path")
-        assert slonk._is_local_path("file://path")
-        assert not slonk._is_local_path("s3://bucket/path")
-        assert not slonk._is_local_path("echo command")
-
-    def test_is_cloud_path(self) -> None:
-        slonk = Slonk()
-        assert slonk._is_cloud_path("s3://bucket/path")
-        assert slonk._is_cloud_path("gs://bucket/path")
-        assert slonk._is_cloud_path("azure://bucket/path")
-        assert slonk._is_cloud_path("wasb://bucket/path")
-        assert not slonk._is_cloud_path("/local/path")
-        assert not slonk._is_cloud_path("echo command")
+        # Local paths
+        assert slonk._is_path("/absolute/path")
+        assert slonk._is_path("./relative/path")
+        assert slonk._is_path("../parent/path")
+        assert slonk._is_path("file://path")
+        # Cloud/remote paths
+        assert slonk._is_path("s3://bucket/path")
+        assert slonk._is_path("gs://bucket/path")
+        assert slonk._is_path("ftp://server/file")
+        assert slonk._is_path("http://example.com/data.csv")
+        assert slonk._is_path("https://example.com/data.csv")
+        assert slonk._is_path("sftp://server/file")
+        # Not paths
+        assert not slonk._is_path("echo command")
+        assert not slonk._is_path("grep pattern")
 
     def test_or_with_local_path(self) -> None:
         slonk = Slonk()
@@ -192,7 +192,7 @@ class TestSlonk:
 
         assert result is slonk
         assert len(slonk.stages) == 1
-        assert isinstance(slonk.stages[0], LocalPathHandler)
+        assert isinstance(slonk.stages[0], PathHandler)
 
     def test_or_with_shell_command(self) -> None:
         slonk = Slonk()
@@ -261,17 +261,18 @@ class TestSlonk:
 
         assert result == ["prefix_test_suffix"]
 
-    @patch("slonk.cloudpathlib.CloudPath")
-    def test_or_with_cloud_path(self, mock_cloud_path: MagicMock) -> None:
-        # Mock cloudpathlib to avoid actual cloud operations
+    @patch("slonk.UPath")
+    def test_or_with_cloud_path(self, mock_upath: MagicMock) -> None:
+        # Mock UPath to avoid actual cloud operations
         mock_instance = MagicMock()
-        mock_cloud_path.return_value = mock_instance
+        mock_upath.return_value = mock_instance
 
         slonk = Slonk()
         result = slonk | "s3://bucket/file.txt"
 
         assert result is slonk
         assert len(slonk.stages) == 1
+        assert isinstance(slonk.stages[0], PathHandler)
 
     def test_or_with_sqlalchemy_model_requires_session(self) -> None:
         slonk = Slonk()

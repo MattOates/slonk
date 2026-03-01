@@ -1,12 +1,40 @@
 import subprocess
 from collections.abc import Iterable
-from pathlib import Path
 from typing import Any, Protocol, Union, runtime_checkable
-from urllib.parse import urlparse
 
-import cloudpathlib
 from sqlalchemy import Column, String, create_engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+from upath import UPath
+
+# Known UPath/fsspec protocols — any URI with one of these schemes is treated as a path.
+_KNOWN_PATH_PROTOCOLS = frozenset(
+    {
+        "file",
+        "local",
+        "memory",
+        "s3",
+        "s3a",
+        "gs",
+        "gcs",
+        "az",
+        "adl",
+        "abfs",
+        "abfss",
+        "ftp",
+        "sftp",
+        "ssh",
+        "http",
+        "https",
+        "hdfs",
+        "smb",
+        "github",
+        "hf",
+        "webdav",
+        "webdav+http",
+        "webdav+https",
+        "data",
+    }
+)
 
 
 class Base(DeclarativeBase):
@@ -25,46 +53,26 @@ class Handler(Protocol):
 
 
 # Define handlers
-class CloudPathHandler:
-    def __init__(self, url: str) -> None:
-        self.url = url
-        self.cloud_path = cloudpathlib.CloudPath(url)  # type: ignore[abstract]
+class PathHandler:
+    """Unified path handler for local and remote filesystems via UPath."""
 
-    def process(self, input_data: Iterable[str] | None) -> Iterable[str]:
-        if input_data is not None:
-            self.write(input_data)  # Write input data to the cloud path
-            return input_data  # Return the input data for onward processing
-        else:
-            return self.read()  # Read from cloud path if no input data
-
-    def write(self, data: Iterable[str]) -> None:
-        with self.cloud_path.open("w") as file:
-            for line in data:
-                file.write(line + "\n")
-
-    def read(self) -> Iterable[str]:
-        with self.cloud_path.open("r") as file:
-            return file.readlines()
-
-
-class LocalPathHandler:
     def __init__(self, path: str) -> None:
-        self.path = Path(path)
+        self.upath = UPath(path)
 
     def process(self, input_data: Iterable[str] | None) -> Iterable[str]:
         if input_data is not None:
-            self.write(input_data)  # Write input data to the local path
-            return input_data  # Return the input data for onward processing
+            self.write(input_data)
+            return input_data
         else:
-            return self.read()  # Read from local path if no input data
+            return self.read()
 
     def write(self, data: Iterable[str]) -> None:
-        with self.path.open("w") as file:
+        with self.upath.open("w") as file:
             for line in data:
                 file.write(line + "\n")
 
     def read(self) -> Iterable[str]:
-        with self.path.open("r") as file:
+        with self.upath.open("r") as file:
             return file.readlines()
 
 
@@ -120,10 +128,8 @@ class Slonk:
         other: Union[str, "Slonk", type[Base], Any],
     ) -> "Slonk":
         if isinstance(other, str):
-            if self._is_local_path(other):
-                self.stages.append(LocalPathHandler(other))
-            elif self._is_cloud_path(other):
-                self.stages.append(CloudPathHandler(other))
+            if self._is_path(other):
+                self.stages.append(PathHandler(other))
             else:
                 self.stages.append(ShellCommandHandler(other))
         elif isinstance(other, Slonk):
@@ -147,17 +153,14 @@ class Slonk:
             output = stage.run(output) if isinstance(stage, Slonk) else stage.process(output)
         return output if output is not None else []
 
-    def _is_local_path(self, string: str) -> bool:
-        return (
-            string.startswith("/")
-            or string.startswith("./")
-            or string.startswith("../")
-            or string.startswith("file://")
-        )
-
-    def _is_cloud_path(self, string: str) -> bool:
-        parsed_url = urlparse(string)
-        return parsed_url.scheme in ("s3", "gs", "azure", "wasb")
+    def _is_path(self, string: str) -> bool:
+        """Detect whether a string represents a filesystem path (local or remote)."""
+        if string.startswith(("/", "./", "../")):
+            return True
+        if "://" in string:
+            scheme = string.split("://", 1)[0].lower()
+            return scheme in _KNOWN_PATH_PROTOCOLS
+        return False
 
     def tee(self, pipeline: "Slonk") -> "Slonk":
         tee_stage = TeeHandler(pipeline)
