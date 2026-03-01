@@ -1,10 +1,17 @@
+from __future__ import annotations
+
 import os
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
 from slonk import PathHandler, ShellCommandHandler, Slonk
+
+if TYPE_CHECKING:
+    from conftest import PipelineRunner
 
 
 class TestErrorHandling:
@@ -40,7 +47,7 @@ class TestErrorHandling:
 
         assert result == [""]
 
-    def test_slonk_chaining_with_none_output(self) -> None:
+    def test_slonk_chaining_with_none_output(self, run_pipeline: PipelineRunner) -> None:
         def return_none(data: object) -> None:
             return None
 
@@ -48,13 +55,11 @@ class TestErrorHandling:
             return ["processed"] if data is None else list(data)  # type: ignore[arg-type]
 
         slonk = Slonk() | return_none | process_none
-        result = list(slonk.run(["input"]))
+        result = list(run_pipeline(slonk, ["input"]))
 
         assert result == ["processed"]
 
-    def test_slonk_with_generator_stages(self) -> None:
-        from collections.abc import Iterator
-
+    def test_slonk_with_generator_stages(self, run_pipeline: PipelineRunner) -> None:
         def generator_stage(data: list[str] | None) -> Iterator[str]:
             if data:
                 for item in data:
@@ -64,38 +69,38 @@ class TestErrorHandling:
             return list(data) if data else []
 
         slonk = Slonk() | generator_stage | list_stage
-        result = list(slonk.run(["a", "b"]))
+        result = list(run_pipeline(slonk, ["a", "b"]))
 
         assert result == ["gen_a", "gen_b"]
 
-    def test_empty_data_through_pipeline(self) -> None:
+    def test_empty_data_through_pipeline(self, run_pipeline: PipelineRunner) -> None:
         def add_prefix(data: list[str] | None) -> list[str]:
             return [f"prefix_{item}" for item in data] if data else []
 
         slonk = Slonk() | add_prefix
-        result = list(slonk.run([]))
+        result = list(run_pipeline(slonk, []))
 
         assert result == []
 
-    def test_slonk_run_with_none_input(self) -> None:
+    def test_slonk_run_with_none_input(self, run_pipeline: PipelineRunner) -> None:
         def handle_none(data: list[str] | None) -> list[str]:
             return ["default"] if data is None else data
 
         slonk = Slonk() | handle_none
-        result = list(slonk.run(None))
+        result = list(run_pipeline(slonk, None))
 
         assert result == ["default"]
 
 
 class TestEdgeCases:
-    def test_large_data_processing(self) -> None:
+    def test_large_data_processing(self, run_pipeline: PipelineRunner) -> None:
         def identity(data: list[str] | None) -> list[str]:
             return list(data) if data else []
 
         # Test with a larger dataset
         large_data = [f"line_{i}" for i in range(1000)]
         slonk = Slonk() | identity
-        result = list(slonk.run(large_data))
+        result = list(run_pipeline(slonk, large_data))
 
         assert len(result) == 1000
         assert result[0] == "line_0"
@@ -118,7 +123,7 @@ class TestEdgeCases:
         finally:
             os.unlink(tmp_path)
 
-    def test_nested_slonk_pipelines(self) -> None:
+    def test_nested_slonk_pipelines(self, run_pipeline: PipelineRunner) -> None:
         def add_a(data: list[str] | None) -> list[str]:
             return [f"{item}_a" for item in data] if data else []
 
@@ -129,7 +134,7 @@ class TestEdgeCases:
         inner_pipeline = Slonk() | add_b
         outer_pipeline = Slonk() | add_a | inner_pipeline
 
-        result = list(outer_pipeline.run(["test"]))
+        result = list(run_pipeline(outer_pipeline, ["test"]))
         assert result == ["test_a_b"]
 
     def test_multiline_shell_output(self) -> None:
@@ -143,7 +148,7 @@ class TestEdgeCases:
         assert "line2" in output
         assert "line3" in output
 
-    def test_binary_data_handling(self) -> None:
+    def test_binary_data_handling(self, run_pipeline: PipelineRunner) -> None:
         # Test that the system handles binary-like data gracefully
         def binary_to_hex(data: list[str] | None) -> list[str]:
             return (
@@ -153,7 +158,7 @@ class TestEdgeCases:
             )
 
         slonk = Slonk() | binary_to_hex
-        result = list(slonk.run(["hello", "world"]))
+        result = list(run_pipeline(slonk, ["hello", "world"]))
 
         assert result[0] == "68656c6c6f"  # "hello" in hex
         assert result[1] == "776f726c64"  # "world" in hex
@@ -186,17 +191,17 @@ class TestSlonkPipelineTypes:
         # Unknown URI schemes are not paths
         assert not slonk._is_path("mailto://user@example.com")
 
-    def test_callable_with_annotations(self) -> None:
+    def test_callable_with_annotations(self, run_pipeline: PipelineRunner) -> None:
         def annotated_func(data: list[str]) -> list[str]:
             return [item.upper() for item in data] if data else []
 
         slonk = Slonk() | annotated_func
-        result = list(slonk.run(["hello", "world"]))
+        result = list(run_pipeline(slonk, ["hello", "world"]))
 
         assert result == ["HELLO", "WORLD"]
 
-    def test_lambda_function(self) -> None:
+    def test_lambda_function(self, run_pipeline: PipelineRunner) -> None:
         slonk = Slonk() | (lambda data: [item[::-1] for item in data] if data else [])
-        result = list(slonk.run(["hello", "world"]))
+        result = list(run_pipeline(slonk, ["hello", "world"]))
 
         assert result == ["olleh", "dlrow"]

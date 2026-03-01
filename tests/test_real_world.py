@@ -1,13 +1,19 @@
+from __future__ import annotations
+
 import os
 import tempfile
+from typing import TYPE_CHECKING
 
 from slonk import Slonk
+
+if TYPE_CHECKING:
+    from conftest import PipelineRunner
 
 
 class TestRealWorldScenarios:
     """Test scenarios that simulate real-world usage patterns."""
 
-    def test_data_transformation_pipeline(self) -> None:
+    def test_data_transformation_pipeline(self, run_pipeline: PipelineRunner) -> None:
         """Test a typical data transformation pipeline."""
 
         def parse_csv_line(data: list[str] | None) -> list[str]:
@@ -39,7 +45,7 @@ class TestRealWorldScenarios:
             "",
         ]
 
-        result = list(slonk.run(input_data))
+        result = list(run_pipeline(slonk, input_data))
 
         assert len(result) == 3
         assert "john|doe" in result
@@ -47,7 +53,7 @@ class TestRealWorldScenarios:
         assert "bob|wilson" in result
         assert "invalid_record" not in result
 
-    def test_log_processing_pipeline(self) -> None:
+    def test_log_processing_pipeline(self, run_pipeline: PipelineRunner) -> None:
         """Test a log processing pipeline using shell commands."""
         with tempfile.TemporaryDirectory() as tmpdir:
             log_file = os.path.join(tmpdir, "access.log")
@@ -71,13 +77,13 @@ class TestRealWorldScenarios:
             # trailing newlines from stdout between stages.
             slonk = Slonk() | log_file | "grep ERROR | wc -l"
 
-            result = list(slonk.run())
+            result = list(run_pipeline(slonk))
 
             # Should count 2 ERROR lines
             assert len(result) == 1
             assert result[0].strip() == "2"
 
-    def test_file_backup_pipeline(self) -> None:
+    def test_file_backup_pipeline(self, run_pipeline: PipelineRunner) -> None:
         """Test a file backup and verification pipeline."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source_file = os.path.join(tmpdir, "source.txt")
@@ -100,7 +106,7 @@ class TestRealWorldScenarios:
             # Pipeline: read source -> copy to backup -> verify
             slonk = Slonk() | source_file | copy_file | f"diff {source_file} {backup_file}"
 
-            result = list(slonk.run())
+            result = list(run_pipeline(slonk))
 
             # If diff returns empty output, files are identical
             assert len(result) == 1
@@ -112,7 +118,7 @@ class TestRealWorldScenarios:
                 backup_content = f.read()
             assert "Important data" in backup_content
 
-    def test_data_aggregation_pipeline(self) -> None:
+    def test_data_aggregation_pipeline(self, run_pipeline: PipelineRunner) -> None:
         """Test data aggregation from multiple sources."""
 
         def generate_numbers(data: object) -> list[str]:
@@ -138,17 +144,17 @@ class TestRealWorldScenarios:
 
         # Test sum pipeline
         sum_pipeline = Slonk() | generate_numbers | calculate_sum
-        sum_result = list(sum_pipeline.run())
+        sum_result = list(run_pipeline(sum_pipeline))
 
         assert sum_result == ["Sum: 15"]  # 1+2+3+4+5 = 15
 
         # Test average pipeline
         avg_pipeline = Slonk() | generate_numbers | calculate_average
-        avg_result = list(avg_pipeline.run())
+        avg_result = list(run_pipeline(avg_pipeline))
 
         assert avg_result == ["Average: 3.0"]  # (1+2+3+4+5)/5 = 3.0
 
-    def test_configuration_processing_pipeline(self) -> None:
+    def test_configuration_processing_pipeline(self, run_pipeline: PipelineRunner) -> None:
         """Test processing configuration files."""
         with tempfile.TemporaryDirectory() as tmpdir:
             config_file = os.path.join(tmpdir, "config.ini")
@@ -194,14 +200,14 @@ class TestRealWorldScenarios:
             # Pipeline: read config -> extract database settings
             slonk = Slonk() | config_file | extract_database_config
 
-            result = list(slonk.run())
+            result = list(run_pipeline(slonk))
 
             assert len(result) == 3
             assert "host=localhost" in result
             assert "port=5432" in result
             assert "username=admin" in result
 
-    def test_text_analysis_pipeline(self) -> None:
+    def test_text_analysis_pipeline(self, run_pipeline: PipelineRunner) -> None:
         """Test text analysis and word counting."""
 
         def tokenize_words(data: list[str] | None) -> list[str]:
@@ -238,7 +244,7 @@ class TestRealWorldScenarios:
             "This is a test of word counting functionality",
         ]
 
-        result = list(slonk.run(input_text))
+        result = list(run_pipeline(slonk, input_text))
 
         # Should have counts for different word lengths
         assert len(result) > 0
@@ -249,7 +255,7 @@ class TestRealWorldScenarios:
 class TestPerformanceScenarios:
     """Test performance-related scenarios."""
 
-    def test_large_dataset_processing(self) -> None:
+    def test_large_dataset_processing(self, run_pipeline: PipelineRunner) -> None:
         """Test processing larger datasets efficiently."""
 
         def process_batch(data: list[str] | None) -> list[str]:
@@ -264,13 +270,13 @@ class TestPerformanceScenarios:
         large_data = [f"data_line_{i}" for i in range(100)]
 
         slonk = Slonk() | process_batch
-        result = list(slonk.run(large_data))
+        result = list(run_pipeline(slonk, large_data))
 
         assert len(result) == 100
         assert result[0] == "1: data_line_0"
         assert result[99] == "100: data_line_99"
 
-    def test_streaming_data_simulation(self) -> None:
+    def test_streaming_data_simulation(self, run_pipeline: PipelineRunner) -> None:
         """Test handling streaming-like data processing."""
 
         def process_stream_chunk(data: list[str] | None) -> list[str]:
@@ -297,6 +303,6 @@ class TestPerformanceScenarios:
 
         # Simulate streaming chunks
         chunk1 = ["item1", "item2", ""]
-        result = list(slonk.run(chunk1))
+        result = list(run_pipeline(slonk, chunk1))
 
         assert result == ["Total processed items: 2"]

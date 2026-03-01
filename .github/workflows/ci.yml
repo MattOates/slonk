@@ -17,7 +17,7 @@ jobs:
         uses: astral-sh/setup-uv@v5
 
       - name: Set up Python
-        run: uv python install 3.12
+        run: uv python install 3.14
 
       - name: Install dependencies
         run: uv sync
@@ -38,7 +38,7 @@ jobs:
         uses: astral-sh/setup-uv@v5
 
       - name: Set up Python
-        run: uv python install 3.12
+        run: uv python install 3.14
 
       - name: Install dependencies
         run: uv sync
@@ -47,8 +47,12 @@ jobs:
         run: uv run mypy src/
 
   test:
-    name: Test
+    name: Test (Python ${{ matrix.python }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.14", "3.14t"]
     steps:
       - uses: actions/checkout@v4
 
@@ -56,10 +60,10 @@ jobs:
         uses: astral-sh/setup-uv@v5
 
       - name: Set up Python
-        run: uv python install 3.12
+        run: uv python install ${{ matrix.python }}
 
       - name: Install dependencies
-        run: uv sync
+        run: uv sync --python ${{ matrix.python }}
 
       - name: Run tests
-        run: uv run pytest --tb=short
+        run: uv run --python ${{ matrix.python }} pytest --tb=short

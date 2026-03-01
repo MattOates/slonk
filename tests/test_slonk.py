@@ -1,10 +1,14 @@
+from __future__ import annotations
+
 import os
 import tempfile
+from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
 
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from slonk import (
     Base,
@@ -16,6 +20,9 @@ from slonk import (
     TeeHandler,
     tee,
 )
+
+if TYPE_CHECKING:
+    from conftest import PipelineRunner
 
 
 class TestPathHandler:
@@ -123,8 +130,13 @@ class TestShellCommandHandler:
 class TestSQLAlchemyHandler:
     @pytest.fixture()
     def setup_db(self) -> sessionmaker:
-        # Create in-memory database for testing
-        engine = create_engine("sqlite:///:memory:")
+        # Use StaticPool + check_same_thread=False so the in-memory DB is
+        # accessible from the streaming pipeline's worker threads.
+        engine = create_engine(
+            "sqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
         Base.metadata.create_all(engine)
         Session = sessionmaker(bind=engine)
 
@@ -228,24 +240,24 @@ class TestSlonk:
         with pytest.raises(TypeError, match="Unsupported type"):
             slonk | 42
 
-    def test_run_simple_pipeline(self) -> None:
+    def test_run_simple_pipeline(self, run_pipeline: PipelineRunner) -> None:
         def double_lines(data: list[str] | None) -> list[str]:
             if data is None:
                 return []
             return [line + line for line in data]
 
         slonk = Slonk() | double_lines
-        result = list(slonk.run(["hello", "world"]))
+        result = list(run_pipeline(slonk, ["hello", "world"]))
 
         assert result == ["hellohello", "worldworld"]
 
-    def test_run_empty_pipeline(self) -> None:
+    def test_run_empty_pipeline(self, run_pipeline: PipelineRunner) -> None:
         slonk = Slonk()
-        result = list(slonk.run(["test"]))
+        result = list(run_pipeline(slonk, ["test"]))
 
         assert result == ["test"]
 
-    def test_run_multi_stage_pipeline(self) -> None:
+    def test_run_multi_stage_pipeline(self, run_pipeline: PipelineRunner) -> None:
         def add_prefix(data: list[str] | None) -> list[str]:
             if data is None:
                 return []
@@ -257,7 +269,7 @@ class TestSlonk:
             return [f"{line}_suffix" for line in data]
 
         slonk = Slonk() | add_prefix | add_suffix
-        result = list(slonk.run(["test"]))
+        result = list(run_pipeline(slonk, ["test"]))
 
         assert result == ["prefix_test_suffix"]
 
@@ -330,28 +342,28 @@ class TestTeeFunction:
 
 
 class TestIntegration:
-    def test_shell_command_pipeline(self) -> None:
+    def test_shell_command_pipeline(self, run_pipeline: PipelineRunner) -> None:
         slonk = Slonk() | "echo hello"
-        result = list(slonk.run(["input"]))
+        result = list(run_pipeline(slonk, ["input"]))
 
         assert len(result) == 1
         assert "hello" in result[0]
 
-    def test_file_write_and_read_pipeline(self) -> None:
+    def test_file_write_and_read_pipeline(self, run_pipeline: PipelineRunner) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             test_file = os.path.join(tmpdir, "test.txt")
 
             # Write pipeline
             write_slonk = Slonk() | test_file
-            write_slonk.run(["hello", "world"])
+            run_pipeline(write_slonk, ["hello", "world"])
 
             # Read pipeline
             read_slonk = Slonk() | test_file
-            result = list(read_slonk.run())
+            result = list(run_pipeline(read_slonk))
 
             assert result == ["hello\n", "world\n"]
 
-    def test_combined_pipeline(self) -> None:
+    def test_combined_pipeline(self, run_pipeline: PipelineRunner) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             test_file = os.path.join(tmpdir, "test.txt")
 
@@ -361,7 +373,7 @@ class TestIntegration:
             # Combined pipeline: transform -> save -> shell process
             slonk = Slonk() | add_prefix | test_file | "grep '>>'"
 
-            result = list(slonk.run(["line1", "line2"]))
+            result = list(run_pipeline(slonk, ["line1", "line2"]))
 
             assert len(result) == 1
             output = result[0]
@@ -370,12 +382,19 @@ class TestIntegration:
 
     @pytest.fixture()
     def setup_test_db(self) -> sessionmaker:
-        # Create a separate engine for testing to avoid conflicts
-        engine = create_engine("sqlite:///:memory:")
+        # Use StaticPool + check_same_thread=False so the in-memory DB is
+        # accessible from the streaming pipeline's worker threads.
+        engine = create_engine(
+            "sqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
         Base.metadata.create_all(engine)
         return sessionmaker(bind=engine)
 
-    def test_sql_to_shell_pipeline(self, setup_test_db: sessionmaker) -> None:
+    def test_sql_to_shell_pipeline(
+        self, setup_test_db: sessionmaker, run_pipeline: PipelineRunner
+    ) -> None:
         # Add test data
         session = setup_test_db()
         session.add_all(
@@ -389,7 +408,7 @@ class TestIntegration:
         session.close()
 
         slonk = Slonk(session_factory=setup_test_db) | ExampleModel | "grep Hello"
-        result = list(slonk.run())
+        result = list(run_pipeline(slonk))
 
         assert len(result) == 1
         output = result[0]
