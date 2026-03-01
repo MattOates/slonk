@@ -1,7 +1,7 @@
 UV_VERSION := 0.10.7
 UV := uvx uv@$(UV_VERSION)
 
-.PHONY: test test-verbose test-coverage test-fast clean install-dev help test-unit test-integration lint typecheck docs docs-serve
+.PHONY: test test-verbose test-coverage test-fast clean install-dev help test-unit test-integration lint typecheck docs docs-serve release-dry-run release-local
 
 help: ## Show this help message
 	@echo "Available commands:"
@@ -47,3 +47,9 @@ docs: ## Build documentation site
 
 docs-serve: ## Serve documentation locally for preview
 	$(UV) run --group docs mkdocs serve
+
+release-dry-run: ## Preview what semantic-release would do (no changes)
+	$(UV) run semantic-release -v --noop version
+
+release-local: ## Run semantic-release locally (commit + tag, no push/publish)
+	$(UV) run semantic-release -v version --no-push --no-vcs-release

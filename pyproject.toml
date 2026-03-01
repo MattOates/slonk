@@ -20,6 +20,7 @@ build-backend = "hatchling.build"
 [dependency-groups]
 dev = [
     "mypy>=1.19.1",
+    "python-semantic-release>=10.5",
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "ruff>=0.15.4",
@@ -82,4 +83,45 @@ check_untyped_defs = true
 module = "cloudpickle.*"
 ignore_missing_imports = true
 follow_untyped_imports = false
+
+# -- Semantic Release ----------------------------------------------------------
+
+[tool.semantic_release]
+commit_parser = "conventional"
+allow_zero_version = true
+major_on_zero = false
+tag_format = "v{version}"
+version_toml = ["pyproject.toml:project.version"]
+build_command = "uv build"
+
+[tool.semantic_release.commit_parser_options]
+minor_tags = ["feat"]
+patch_tags = ["fix", "perf"]
+
+[tool.semantic_release.changelog]
+mode = "update"
+exclude_commit_patterns = [
+    '''chore(?:\([^)]*?\))?: .+''',
+    '''ci(?:\([^)]*?\))?: .+''',
+    '''refactor(?:\([^)]*?\))?: .+''',
+    '''style(?:\([^)]*?\))?: .+''',
+    '''test(?:\([^)]*?\))?: .+''',
+    '''build\((?!deps\): .+)''',
+]
+
+[tool.semantic_release.changelog.default_templates]
+changelog_file = "CHANGELOG.md"
+output_format = "md"
+
+[tool.semantic_release.remote]
+type = "github"
+token = { env = "GH_TOKEN" }
+
+[tool.semantic_release.publish]
+dist_glob_patterns = ["dist/*"]
+upload_to_vcs_release = true
+
+[tool.semantic_release.branches.main]
+match = "main"
+prerelease = false
 

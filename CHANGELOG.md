@@ -1,13 +1,10 @@
-# Changelog
+# CHANGELOG
 
-All notable changes to this project will be documented in this file.
+<!-- version list -->
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/),
-and this project adheres to [Semantic Versioning](https://semver.org/).
+## v0.1.1 (2026-03-01)
 
-## [Unreleased]
-
-### Added
+### Feature
 
 - Comprehensive Google-style docstrings on all public and key internal symbols.
 - Doctest examples throughout the library, tested via `--doctest-modules`.
@@ -15,11 +12,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `LICENSE` (MIT), `CONTRIBUTING.md`, and `CHANGELOG.md`.
 - GitHub Actions workflow for documentation deployment.
 - `docs` and `docs-serve` Makefile targets.
-
-## [0.1.1] - 2026
-
-### Added
-
 - Middleware system with `Middleware` base class, `_EventDispatcher`, and
   built-in `TimingMiddleware`, `LoggingMiddleware`, `StatsMiddleware`.
 - Multi-module package split (was single-file).
@@ -32,16 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `SlonkBase` mixin for custom event emission.
 - GitHub Actions CI (lint, typecheck, test on Python 3.14 and 3.14t).
 - Ruff and mypy configuration.
-
-### Changed
-
 - Replaced `cloudpathlib` with `universal-pathlib` (UPath).
 - Migrated toolchain from Rye to uv.
 - Requires Python >= 3.14.
 
-## [0.1.0] - 2024
+## v0.1.0 (2024-01-01)
 
-### Added
+### Feature
 
 - Initial implementation of `Slonk` pipeline builder with `|` operator.
 - `PathHandler` for local/cloud file I/O.
