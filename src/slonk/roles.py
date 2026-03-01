@@ -7,6 +7,11 @@ pipeline and the type-hints / protocols it implements.  The
 :func:`~typing.runtime_checkable` protocol classes define the method
 contracts handlers must satisfy.
 
+The protocols are generic: ``Source[T]`` produces ``T`` items,
+``Transform[T_in, T_out]`` maps ``T_in`` to ``T_out``, and
+``Sink[T]`` consumes ``T`` items.  When left unparameterised they
+default to :data:`~typing.Any`, preserving backward compatibility.
+
 Examples:
     >>> from slonk.roles import _Role
     >>> _Role.SOURCE.value
@@ -21,7 +26,7 @@ from __future__ import annotations
 
 import enum
 from collections.abc import Iterable
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 
 class _Role(enum.Enum):
@@ -39,10 +44,10 @@ class _Role(enum.Enum):
 
 
 @runtime_checkable
-class Source(Protocol):
+class Source[T = Any](Protocol):
     """A stage that produces data from nothing (first stage, no seed data).
 
-    Return an ``Iterable[str]``.  If the iterable is a generator the pipeline
+    Return an ``Iterable[T]``.  If the iterable is a generator the pipeline
     will stream items lazily; if it is a list they are pushed in one go.
 
     Examples:
@@ -54,16 +59,16 @@ class Source(Protocol):
         True
     """
 
-    def process_source(self) -> Iterable[str]:
+    def process_source(self) -> Iterable[T]:
         """Produce items with no input."""
         ...
 
 
 @runtime_checkable
-class Transform(Protocol):
+class Transform[T_in = Any, T_out = Any](Protocol):
     """A stage that receives input and produces output.
 
-    ``input_data`` is always a real ``Iterable[str]`` — never ``None``.
+    ``input_data`` is always a real ``Iterable[T_in]`` — never ``None``.
     In parallel mode it may be a lazy queue-backed iterator; in sync mode
     it is typically a list.  Handlers may iterate it however they like.
 
@@ -76,13 +81,13 @@ class Transform(Protocol):
         True
     """
 
-    def process_transform(self, input_data: Iterable[str]) -> Iterable[str]:
+    def process_transform(self, input_data: Iterable[T_in]) -> Iterable[T_out]:
         """Transform *input_data* into new output."""
         ...
 
 
 @runtime_checkable
-class Sink(Protocol):
+class Sink[T = Any](Protocol):
     """A stage that consumes input as the final pipeline stage.
 
     Returns ``None``.  The pipeline's return value when ending with a
@@ -99,10 +104,10 @@ class Sink(Protocol):
         True
     """
 
-    def process_sink(self, input_data: Iterable[str]) -> None:
+    def process_sink(self, input_data: Iterable[T]) -> None:
         """Consume *input_data* with no output."""
         ...
 
 
 # Type alias for stages.  Slonk sub-pipelines act as Transform.
-type StageType = Source | Transform | Sink
+type StageType = Source[Any] | Transform[Any, Any] | Sink[Any]

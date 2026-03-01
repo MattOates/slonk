@@ -24,6 +24,13 @@ from slonk.queue import _drain_queue, _QueueDrainState, _tracked_queue_iter
 from slonk.roles import Sink, Source, StageType, Transform, _Role
 
 
+def _remaining_timeout(deadline: float | None) -> float | None:
+    """Return seconds left until *deadline*, or ``None`` if no deadline is set."""
+    if deadline is None:
+        return None
+    return max(deadline - time.monotonic(), 0)
+
+
 class _StreamingPipeline:
     """Executes pipeline stages concurrently via threads connected by bounded queues.
 
@@ -53,20 +60,29 @@ class _StreamingPipeline:
         self.max_queue_size = max_queue_size
         self.dispatcher = dispatcher
 
-    def execute(self, input_data: Iterable[Any] | None) -> list[str]:
+    def execute(
+        self,
+        input_data: Iterable[Any] | None,
+        timeout: float | None = None,
+    ) -> list[Any]:
         """Run all stages concurrently and return the final output.
 
         Args:
             input_data: Optional seed data for the first stage.
+            timeout: Maximum wall-clock seconds to wait for the pipeline
+                to finish.  ``None`` (the default) means no limit.
 
         Returns:
             Collected output from the last stage.
 
         Raises:
+            TimeoutError: If the pipeline does not complete within *timeout*.
             BaseException: Re-raises the first error from any stage thread.
         """
         if not self.stages:
             return list(input_data) if input_data is not None else []
+
+        deadline = time.monotonic() + timeout if timeout is not None else None
 
         # Build N+1 queues for N stages.
         queues: list[Queue[Any]] = [
@@ -105,18 +121,45 @@ class _StreamingPipeline:
         queues[0].put(_DONE)
 
         # Drain the final output queue.
-        output: list[str] = []
+        timed_out = False
+        output: list[Any] = []
         while True:
-            item = queues[-1].get()
+            remaining = _remaining_timeout(deadline)
+            if remaining is not None and remaining <= 0:
+                timed_out = True
+                break
+            try:
+                item = queues[-1].get(timeout=remaining)
+            except Exception:
+                # queue.Empty on get timeout
+                timed_out = True
+                break
             if item is _DONE:
                 break
             output.append(item)
 
-        # Wait for all threads to finish.
-        for t in threads:
-            t.join()
+        if timed_out:
+            # Non-blocking drain: remove any pending items from queues to
+            # unblock threads that may be stuck on a full-queue put().
+            # We cannot use _drain_queue here because it blocks waiting
+            # for _DONE, which may never arrive if a thread is sleeping.
+            for q in queues:
+                while not q.empty():
+                    try:
+                        q.get_nowait()
+                    except Exception:
+                        break
 
-        # Re-raise the first error encountered.
+        # Wait for all threads to finish.  On timeout the threads are
+        # daemon threads, so a brief join is best-effort — we don't want
+        # to block the caller any longer.
+        for t in threads:
+            t.join(timeout=0.1 if timed_out else None)
+
+        # Re-raise the first error encountered (timeout takes priority).
+        if timed_out:
+            raise TimeoutError(f"Pipeline did not complete within {timeout} seconds")
+
         if errors:
             raise errors[0]
 

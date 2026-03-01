@@ -360,9 +360,9 @@ class TestRoleProtocol:
         handler = ShellCommandHandler("echo hi")
         assert isinstance(handler, Transform)
 
-    def test_shell_command_handler_is_not_source(self) -> None:
+    def test_shell_command_handler_is_source(self) -> None:
         handler = ShellCommandHandler("echo hi")
-        assert not isinstance(handler, Source)
+        assert isinstance(handler, Source)
 
     def test_shell_command_handler_is_not_sink(self) -> None:
         handler = ShellCommandHandler("echo hi")
