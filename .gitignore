@@ -14,3 +14,6 @@ site/
 
 # OS
 .DS_Store
+
+# AI
+.opencode/

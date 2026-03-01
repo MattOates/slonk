@@ -9,9 +9,23 @@ It also provides:
 * :class:`TeeHandler` — fork data to a side-pipeline while passing it through.
 * :class:`MergeHandler` — merge upstream data with sub-pipeline outputs (interleaved).
 * :class:`CatHandler` — concatenate upstream data with sub-pipeline outputs (ordered).
+* :class:`FilterHandler` — keep only items matching a predicate.
+* :class:`MapHandler` — transform each item with a function.
+* :class:`FlattenHandler` — flatten one level of nesting.
+* :class:`HeadHandler` — yield only the first *n* items.
+* :class:`SkipHandler` — skip the first *n* items.
+* :class:`TailHandler` — yield only the last *n* items.
+* :class:`BatchHandler` — group items into fixed-size batches.
 * :func:`tee` — convenience factory that creates a ``TeeHandler``-bearing pipeline.
 * :func:`merge` — convenience factory that creates a ``MergeHandler``-bearing pipeline.
 * :func:`cat` — convenience factory that creates a ``CatHandler``-bearing pipeline.
+* :func:`filter` — convenience factory that creates a ``FilterHandler``-bearing pipeline.
+* :func:`map` — convenience factory that creates a ``MapHandler``-bearing pipeline.
+* :func:`flatten` — convenience factory that creates a ``FlattenHandler``-bearing pipeline.
+* :func:`head` — convenience factory that creates a ``HeadHandler``-bearing pipeline.
+* :func:`skip` — convenience factory that creates a ``SkipHandler``-bearing pipeline.
+* :func:`tail` — convenience factory that creates a ``TailHandler``-bearing pipeline.
+* :func:`batch` — convenience factory that creates a ``BatchHandler``-bearing pipeline.
 * :func:`_compute_roles` — assign :class:`~slonk.roles._Role` to each stage.
 
 Examples:
@@ -31,7 +45,7 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
@@ -42,6 +56,9 @@ from slonk.handlers import (
     PathHandler,
     ShellCommandHandler,
     SQLAlchemyHandler,
+    _CallableSink,
+    _CallableSource,
+    _CallableTransform,
     _ParallelHandler,
     _wrap_callable,
 )
@@ -168,7 +185,7 @@ class TeeHandler(SlonkBase):
     def __init__(self, pipeline: Slonk) -> None:
         self.pipeline = pipeline
 
-    def process_transform(self, input_data: Iterable[str]) -> Iterable[str]:
+    def process_transform(self, input_data: Iterable[Any]) -> Iterable[Any]:
         """Run side pipeline and return original data plus side results.
 
         The input is materialised into a list so that both the passthrough
@@ -182,7 +199,7 @@ class TeeHandler(SlonkBase):
         """
         data = list(input_data)
 
-        side_result: list[str] = []
+        side_result: list[Any] = []
         error: BaseException | None = None
 
         def _run_side() -> None:
@@ -199,7 +216,7 @@ class TeeHandler(SlonkBase):
         if error is not None:
             raise error
 
-        results: list[str] = list(data)
+        results: list[Any] = list(data)
         results.extend(side_result)
         return results
 
@@ -223,7 +240,7 @@ class MergeHandler(SlonkBase):
     def __init__(self, *pipelines: Slonk) -> None:
         self.pipelines: tuple[Slonk, ...] = pipelines
 
-    def process_transform(self, input_data: Iterable[str]) -> Iterable[str]:
+    def process_transform(self, input_data: Iterable[Any]) -> Iterable[Any]:
         """Merge upstream data with sub-pipeline outputs concurrently.
 
         Each producer (upstream + N sub-pipelines) pushes items into a
@@ -307,7 +324,7 @@ class CatHandler(SlonkBase):
     def __init__(self, *pipelines: Slonk) -> None:
         self.pipelines: tuple[Slonk, ...] = pipelines
 
-    def process_transform(self, input_data: Iterable[str]) -> Iterable[str]:
+    def process_transform(self, input_data: Iterable[Any]) -> Iterable[Any]:
         """Yield upstream data followed by each sub-pipeline's output in order.
 
         Args:
@@ -320,6 +337,219 @@ class CatHandler(SlonkBase):
         yield from input_data
         for pipeline in self.pipelines:
             yield from pipeline.run_sync()
+
+
+class FilterHandler(SlonkBase):
+    """Yield only items for which the predicate returns True.
+
+    Implements :class:`~slonk.roles.Transform`.
+
+    Args:
+        predicate: A callable that takes a single item and returns a
+            truthy value to keep the item, or a falsy value to drop it.
+    """
+
+    def __init__(self, predicate: Callable[[Any], Any]) -> None:
+        self.predicate = predicate
+
+    def process_transform(self, input_data: Iterable[Any]) -> Iterable[Any]:
+        """Yield items that satisfy the predicate.
+
+        Args:
+            input_data: Items from the upstream stage.
+
+        Yields:
+            Items for which ``predicate(item)`` is truthy.
+        """
+        for item in input_data:
+            if self.predicate(item):
+                yield item
+
+
+class MapHandler(SlonkBase):
+    """Apply a function to each item individually.
+
+    Implements :class:`~slonk.roles.Transform`.
+
+    Args:
+        func: A callable that takes a single item and returns a
+            transformed item.
+    """
+
+    def __init__(self, func: Callable[[Any], Any]) -> None:
+        self.func = func
+
+    def process_transform(self, input_data: Iterable[Any]) -> Iterable[Any]:
+        """Apply the function to each item.
+
+        Args:
+            input_data: Items from the upstream stage.
+
+        Yields:
+            The result of ``func(item)`` for each item.
+        """
+        for item in input_data:
+            yield self.func(item)
+
+
+class FlattenHandler(SlonkBase):
+    """Flatten one level of nesting — if an item is iterable, yield its elements.
+
+    Implements :class:`~slonk.roles.Transform`.
+
+    Strings and bytes are treated as atoms (not iterated into characters).
+    Non-iterable items are yielded as-is.
+    """
+
+    def process_transform(self, input_data: Iterable[Any]) -> Iterable[Any]:
+        """Flatten one level of nesting.
+
+        Args:
+            input_data: Items from the upstream stage.
+
+        Yields:
+            Elements from iterable items, or the item itself if it is
+            a string, bytes, or non-iterable value.
+        """
+        for item in input_data:
+            if isinstance(item, (str, bytes)):
+                yield item  # Don't iterate characters of a string
+            else:
+                try:
+                    yield from item
+                except TypeError:
+                    yield item  # Not iterable, yield as-is
+
+
+class HeadHandler(SlonkBase):
+    """Yield only the first *n* items.
+
+    Implements :class:`~slonk.roles.Transform`.
+
+    After yielding *n* items the remaining input is drained to avoid
+    blocking upstream queues in parallel mode.
+
+    Args:
+        n: Maximum number of items to yield.
+    """
+
+    def __init__(self, n: int) -> None:
+        self.n = n
+
+    def process_transform(self, input_data: Iterable[Any]) -> Iterable[Any]:
+        """Yield at most *n* items, then drain the rest.
+
+        Args:
+            input_data: Items from the upstream stage.
+
+        Yields:
+            Up to *n* items from the input.
+        """
+        for i, item in enumerate(input_data):
+            if i >= self.n:
+                # Drain remaining input to avoid blocking upstream in parallel mode.
+                for _ in input_data:
+                    pass
+                return
+            yield item
+
+
+class SkipHandler(SlonkBase):
+    """Skip the first *n* items, then yield the rest.
+
+    Implements :class:`~slonk.roles.Transform`.
+
+    Args:
+        n: Number of leading items to discard.
+    """
+
+    def __init__(self, n: int) -> None:
+        self.n = n
+
+    def process_transform(self, input_data: Iterable[Any]) -> Iterable[Any]:
+        """Discard the first *n* items and yield the remainder.
+
+        Args:
+            input_data: Items from the upstream stage.
+
+        Yields:
+            Items after the first *n* have been skipped.
+        """
+        it = iter(input_data)
+        for i, item in enumerate(it):
+            if i >= self.n:
+                yield item
+                break
+        yield from it  # yield remaining after break
+
+
+class TailHandler(SlonkBase):
+    """Yield only the last *n* items (requires full materialisation).
+
+    Implements :class:`~slonk.roles.Transform`.
+
+    Uses :class:`collections.deque` with a bounded ``maxlen`` so only
+    the last *n* items are retained in memory.
+
+    Args:
+        n: Number of trailing items to yield.
+    """
+
+    def __init__(self, n: int) -> None:
+        self.n = n
+
+    def process_transform(self, input_data: Iterable[Any]) -> Iterable[Any]:
+        """Consume all input and yield the last *n* items.
+
+        Args:
+            input_data: Items from the upstream stage.
+
+        Returns:
+            A deque containing at most the last *n* items.
+        """
+        from collections import deque
+
+        return deque(input_data, maxlen=self.n)
+
+
+class BatchHandler(SlonkBase):
+    """Group items into fixed-size batches (lists).
+
+    Implements :class:`~slonk.roles.Transform`.
+
+    Downstream stages receive ``list[T]`` items instead of individual
+    ``T`` items.  The final batch may be smaller than *size* if the
+    input count is not evenly divisible.
+
+    Args:
+        size: Maximum number of items per batch.  Must be >= 1.
+
+    Raises:
+        ValueError: If *size* is less than 1.
+    """
+
+    def __init__(self, size: int) -> None:
+        if size < 1:
+            raise ValueError("Batch size must be >= 1")
+        self.size = size
+
+    def process_transform(self, input_data: Iterable[Any]) -> Iterable[list[Any]]:
+        """Yield batches of items.
+
+        Args:
+            input_data: Items from the upstream stage.
+
+        Yields:
+            Lists of up to *size* items each.
+        """
+        batch: list[Any] = []
+        for item in input_data:
+            batch.append(item)
+            if len(batch) >= self.size:
+                yield batch
+                batch = []
+        if batch:  # yield remaining partial batch
+            yield batch
 
 
 class Slonk:
@@ -408,6 +638,33 @@ class Slonk:
             raise TypeError(f"Unsupported type: {type(other)}")
         return self
 
+    def __repr__(self) -> str:
+        """Human-readable pipeline visualisation.
+
+        Returns:
+            A string like ``Slonk(lambda | grep ERROR | sort | ./output.txt)``.
+        """
+        if not self.stages:
+            return "Slonk()"
+        parts = [self._stage_label(stage) for stage in self.stages]
+        return f"Slonk({' | '.join(parts)})"
+
+    @staticmethod
+    def _stage_label(stage: Any) -> str:
+        """Human-readable label for a single pipeline stage."""
+        if isinstance(stage, PathHandler):
+            return str(stage.upath)
+        if isinstance(stage, ShellCommandHandler):
+            return stage.command
+        if isinstance(stage, (_CallableSource, _CallableTransform, _CallableSink)):
+            name = getattr(stage.func, "__name__", None) or getattr(
+                stage.func, "__qualname__", None
+            )
+            return name if name and name != "<lambda>" else "lambda"
+        if isinstance(stage, Slonk):
+            return repr(stage)
+        return type(stage).__name__
+
     # ------------------------------------------------------------------
     # Middleware registration API
     # ------------------------------------------------------------------
@@ -459,7 +716,7 @@ class Slonk:
         max_queue_size: int = _DEFAULT_MAX_QUEUE_SIZE,
         timeout: float | None = None,
         middleware: list[Middleware] | None = None,
-    ) -> Iterable[str]:
+    ) -> Iterable[Any]:
         """Run the pipeline.
 
         Args:
@@ -469,17 +726,25 @@ class Slonk:
                 Set to ``False`` for sequential behaviour.
             max_queue_size: Backpressure limit between stages
                 (parallel mode only).
-            timeout: Reserved for future use.
+            timeout: Maximum wall-clock seconds to wait for the pipeline
+                to finish (parallel mode only).  ``None`` means no limit.
             middleware: Additional middleware for this run only (merged
                 with persistent middleware registered via
                 :meth:`add_middleware`).
 
         Returns:
-            The pipeline output as an iterable of strings.
+            The pipeline output as an iterable.
+
+        Raises:
+            TimeoutError: If *timeout* is set and the pipeline does not
+                complete in time (parallel mode only).
         """
         if parallel:
             return self.run_parallel(
-                input_data, max_queue_size=max_queue_size, middleware=middleware
+                input_data,
+                max_queue_size=max_queue_size,
+                timeout=timeout,
+                middleware=middleware,
             )
         return self.run_sync(input_data, middleware=middleware)
 
@@ -488,7 +753,7 @@ class Slonk:
         input_data: Iterable[Any] | None = None,
         *,
         middleware: list[Middleware] | None = None,
-    ) -> Iterable[str]:
+    ) -> Iterable[Any]:
         """Run the pipeline sequentially — each stage blocks until complete.
 
         Args:
@@ -496,7 +761,7 @@ class Slonk:
             middleware: Additional per-run middleware.
 
         Returns:
-            The pipeline output as an iterable of strings.
+            The pipeline output as an iterable.
         """
         if not self.stages:
             return list(input_data) if input_data is not None else []
@@ -548,8 +813,9 @@ class Slonk:
         input_data: Iterable[Any] | None = None,
         *,
         max_queue_size: int = _DEFAULT_MAX_QUEUE_SIZE,
+        timeout: float | None = None,
         middleware: list[Middleware] | None = None,
-    ) -> Iterable[str]:
+    ) -> Iterable[Any]:
         """Run the pipeline with streaming/parallel execution.
 
         Each stage runs in its own thread.  Bounded queues between stages
@@ -559,10 +825,16 @@ class Slonk:
         Args:
             input_data: Seed data fed into the first stage.
             max_queue_size: Backpressure limit between stages.
+            timeout: Maximum wall-clock seconds to wait for the pipeline
+                to finish.  ``None`` (the default) means no limit.
             middleware: Additional per-run middleware.
 
         Returns:
-            The pipeline output as a list of strings.
+            The pipeline output as a list.
+
+        Raises:
+            TimeoutError: If *timeout* is set and the pipeline does not
+                complete in time.
         """
         roles = _compute_roles(self.stages, has_seed=input_data is not None)
 
@@ -575,7 +847,7 @@ class Slonk:
             sp = _StreamingPipeline(
                 self.stages, roles, max_queue_size=max_queue_size, dispatcher=dispatcher
             )
-            result = sp.execute(input_data)
+            result = sp.execute(input_data, timeout=timeout)
         finally:
             self._stop_middleware(dispatcher, self.stages, roles, pipeline_start)
             self._cleanup_stages(self.stages)
@@ -789,6 +1061,90 @@ class Slonk:
         self.stages.append(CatHandler(*pipelines))
         return self
 
+    def filter(self, predicate: Callable[[Any], Any]) -> Slonk:
+        """Append a filter stage that keeps items satisfying the predicate.
+
+        Args:
+            predicate: A callable that returns a truthy value to keep an item.
+
+        Returns:
+            ``self`` for fluent chaining.
+        """
+        self.stages.append(FilterHandler(predicate))
+        return self
+
+    def map(self, func: Callable[[Any], Any]) -> Slonk:
+        """Append a map stage that transforms each item individually.
+
+        Args:
+            func: A callable applied to each item.
+
+        Returns:
+            ``self`` for fluent chaining.
+        """
+        self.stages.append(MapHandler(func))
+        return self
+
+    def flatten(self) -> Slonk:
+        """Append a flatten stage that removes one level of nesting.
+
+        Strings and bytes are treated as atoms (not iterated into
+        characters).
+
+        Returns:
+            ``self`` for fluent chaining.
+        """
+        self.stages.append(FlattenHandler())
+        return self
+
+    def head(self, n: int) -> Slonk:
+        """Append a head stage that yields only the first *n* items.
+
+        Args:
+            n: Maximum number of items to yield.
+
+        Returns:
+            ``self`` for fluent chaining.
+        """
+        self.stages.append(HeadHandler(n))
+        return self
+
+    def skip(self, n: int) -> Slonk:
+        """Append a skip stage that discards the first *n* items.
+
+        Args:
+            n: Number of leading items to discard.
+
+        Returns:
+            ``self`` for fluent chaining.
+        """
+        self.stages.append(SkipHandler(n))
+        return self
+
+    def tail(self, n: int) -> Slonk:
+        """Append a tail stage that yields only the last *n* items.
+
+        Args:
+            n: Number of trailing items to yield.
+
+        Returns:
+            ``self`` for fluent chaining.
+        """
+        self.stages.append(TailHandler(n))
+        return self
+
+    def batch(self, size: int) -> Slonk:
+        """Append a batch stage that groups items into fixed-size lists.
+
+        Args:
+            size: Maximum number of items per batch.  Must be >= 1.
+
+        Returns:
+            ``self`` for fluent chaining.
+        """
+        self.stages.append(BatchHandler(size))
+        return self
+
 
 def tee(pipeline: Slonk) -> Slonk:
     """Convenience factory: create a new :class:`Slonk` with a tee stage.
@@ -837,4 +1193,121 @@ def cat(*pipelines: Slonk) -> Slonk:
     """
     s = Slonk()
     s.cat(*pipelines)
+    return s
+
+
+def filter(predicate: Callable[[Any], Any]) -> Slonk:
+    """Convenience factory: create a new :class:`Slonk` with a filter stage.
+
+    Equivalent to ``Slonk().filter(predicate)``.
+
+    Note:
+        This shadows the builtin ``filter``.  Import explicitly from
+        ``slonk`` when you need it.
+
+    Args:
+        predicate: A callable that returns a truthy value to keep an item.
+
+    Returns:
+        A new :class:`Slonk` containing a single :class:`FilterHandler` stage.
+    """
+    s = Slonk()
+    s.filter(predicate)
+    return s
+
+
+def map(func: Callable[[Any], Any]) -> Slonk:
+    """Convenience factory: create a new :class:`Slonk` with a map stage.
+
+    Equivalent to ``Slonk().map(func)``.
+
+    Note:
+        This shadows the builtin ``map``.  Import explicitly from
+        ``slonk`` when you need it.
+
+    Args:
+        func: A callable applied to each item.
+
+    Returns:
+        A new :class:`Slonk` containing a single :class:`MapHandler` stage.
+    """
+    s = Slonk()
+    s.map(func)
+    return s
+
+
+def flatten() -> Slonk:
+    """Convenience factory: create a new :class:`Slonk` with a flatten stage.
+
+    Equivalent to ``Slonk().flatten()``.
+
+    Returns:
+        A new :class:`Slonk` containing a single :class:`FlattenHandler` stage.
+    """
+    s = Slonk()
+    s.flatten()
+    return s
+
+
+def head(n: int) -> Slonk:
+    """Convenience factory: create a new :class:`Slonk` with a head stage.
+
+    Equivalent to ``Slonk().head(n)``.
+
+    Args:
+        n: Maximum number of items to yield.
+
+    Returns:
+        A new :class:`Slonk` containing a single :class:`HeadHandler` stage.
+    """
+    s = Slonk()
+    s.head(n)
+    return s
+
+
+def skip(n: int) -> Slonk:
+    """Convenience factory: create a new :class:`Slonk` with a skip stage.
+
+    Equivalent to ``Slonk().skip(n)``.
+
+    Args:
+        n: Number of leading items to discard.
+
+    Returns:
+        A new :class:`Slonk` containing a single :class:`SkipHandler` stage.
+    """
+    s = Slonk()
+    s.skip(n)
+    return s
+
+
+def tail(n: int) -> Slonk:
+    """Convenience factory: create a new :class:`Slonk` with a tail stage.
+
+    Equivalent to ``Slonk().tail(n)``.
+
+    Args:
+        n: Number of trailing items to yield.
+
+    Returns:
+        A new :class:`Slonk` containing a single :class:`TailHandler` stage.
+    """
+    s = Slonk()
+    s.tail(n)
+    return s
+
+
+def batch(size: int) -> Slonk:
+    """Convenience factory: create a new :class:`Slonk` with a batch stage.
+
+    Equivalent to ``Slonk().batch(size)``.
+
+    Args:
+        size: Maximum number of items per batch.  Must be >= 1.
+
+    Returns:
+        A new :class:`Slonk` containing a single :class:`BatchHandler` stage.
+    """
+    s = Slonk()
+    s.batch(size)
     return s

@@ -119,9 +119,9 @@ class PathHandler(SlonkBase):
 class ShellCommandHandler(SlonkBase):
     """Runs a shell command, piping data through stdin/stdout.
 
-    Implements :class:`~slonk.roles.Transform` — stdin is fed from the
-    input iterable via a writer thread, and stdout lines are yielded as
-    they arrive.
+    Implements :class:`~slonk.roles.Source` (run with no stdin) and
+    :class:`~slonk.roles.Transform` (stdin fed from the input iterable
+    via a writer thread, stdout lines yielded as they arrive).
 
     Args:
         command: The shell command string to execute.
@@ -135,6 +135,38 @@ class ShellCommandHandler(SlonkBase):
 
     def __init__(self, command: str) -> None:
         self.command = command
+
+    # -- Source ------------------------------------------------------------
+
+    def process_source(self) -> Iterable[str]:
+        """Run the command with no stdin, yielding stdout lines.
+
+        Useful for commands that generate output on their own
+        (e.g. ``echo hello``, ``seq 5``, ``ls``).
+
+        Yields:
+            Non-empty lines from the command's stdout.
+
+        Raises:
+            RuntimeError: If the command exits with a non-zero return code.
+        """
+        proc = subprocess.Popen(
+            self.command,
+            shell=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert proc.stdout is not None
+        for raw_line in proc.stdout:
+            line = raw_line.decode().rstrip("\n")
+            if line:
+                yield line
+        proc.wait()
+        if proc.returncode != 0:
+            assert proc.stderr is not None
+            stderr = proc.stderr.read().decode()
+            raise RuntimeError(f"Command failed with error: {stderr}")
 
     # -- Transform ---------------------------------------------------------
 
@@ -424,9 +456,9 @@ class _CallableSource(SlonkBase):
     def __init__(self, func: Any) -> None:
         self.func = func
 
-    def process_source(self) -> Iterable[str]:
+    def process_source(self) -> Iterable[Any]:
         """Invoke the wrapped callable and return its result."""
-        result: Iterable[str] = self.func()
+        result: Iterable[Any] = self.func()
         return result
 
 
@@ -447,9 +479,9 @@ class _CallableTransform(SlonkBase):
     def __init__(self, func: Any) -> None:
         self.func = func
 
-    def process_transform(self, input_data: Iterable[str]) -> Iterable[str]:
+    def process_transform(self, input_data: Iterable[Any]) -> Iterable[Any]:
         """Invoke the wrapped callable with *input_data*."""
-        result: Iterable[str] = self.func(input_data)
+        result: Iterable[Any] = self.func(input_data)
         return result
 
 
@@ -472,7 +504,7 @@ class _CallableSink(SlonkBase):
     def __init__(self, func: Any) -> None:
         self.func = func
 
-    def process_sink(self, input_data: Iterable[str]) -> None:
+    def process_sink(self, input_data: Iterable[Any]) -> None:
         """Invoke the wrapped callable with *input_data*."""
         self.func(input_data)
 
@@ -524,7 +556,7 @@ class _ParallelHandler(SlonkBase):
 
     def __init__(
         self,
-        func: Callable[..., Iterable[str]],
+        func: Callable[..., Iterable[Any]],
         workers: int = 4,
         chunk_size: int = 100,
     ) -> None:
@@ -532,7 +564,7 @@ class _ParallelHandler(SlonkBase):
         self.workers = workers
         self.chunk_size = chunk_size
 
-    def process_transform(self, input_data: Iterable[str]) -> Iterable[str]:
+    def process_transform(self, input_data: Iterable[Any]) -> Iterable[Any]:
         """Split input into chunks and process in parallel.
 
         Args:
@@ -546,7 +578,7 @@ class _ParallelHandler(SlonkBase):
             return self.func([])
 
         # Split into chunks.
-        chunks: list[list[str]] = [
+        chunks: list[list[Any]] = [
             items[i : i + self.chunk_size] for i in range(0, len(items), self.chunk_size)
         ]
 
@@ -557,20 +589,20 @@ class _ParallelHandler(SlonkBase):
             return self._run_threaded(chunks)
         return self._run_multiprocess(chunks)
 
-    def _run_threaded(self, chunks: list[list[str]]) -> list[str]:
+    def _run_threaded(self, chunks: list[list[Any]]) -> list[Any]:
         """Execute chunks using threads (free-threaded Python)."""
-        results: list[str] = []
+        results: list[Any] = []
         with ThreadPoolExecutor(max_workers=self.workers) as pool:
             futures = [pool.submit(self.func, chunk) for chunk in chunks]
             for future in futures:
                 results.extend(future.result())
         return results
 
-    def _run_multiprocess(self, chunks: list[list[str]]) -> list[str]:
+    def _run_multiprocess(self, chunks: list[list[Any]]) -> list[Any]:
         """Execute chunks using processes with cloudpickle serialisation."""
         pickled_func = cloudpickle.dumps(self.func)
 
-        results: list[str] = []
+        results: list[Any] = []
         with ProcessPoolExecutor(max_workers=self.workers) as pool:
             futures = [pool.submit(_unpickle_and_call, pickled_func, chunk) for chunk in chunks]
             for future in futures:
@@ -578,12 +610,12 @@ class _ParallelHandler(SlonkBase):
         return results
 
 
-def _unpickle_and_call(pickled_func: bytes, chunk: list[str]) -> list[str]:
+def _unpickle_and_call(pickled_func: bytes, chunk: list[Any]) -> list[Any]:
     """Deserialise a cloudpickled callable and invoke it (runs in worker process).
 
     Args:
         pickled_func: The cloudpickle-serialised callable bytes.
-        chunk: The list of string items to process.
+        chunk: The list of items to process.
 
     Returns:
         The result of calling the unpickled function on *chunk*.
@@ -593,7 +625,7 @@ def _unpickle_and_call(pickled_func: bytes, chunk: list[str]) -> list[str]:
 
 
 def parallel(
-    func: Callable[..., Iterable[str]],
+    func: Callable[..., Iterable[Any]],
     workers: int = 4,
     chunk_size: int = 100,
 ) -> _ParallelHandler:

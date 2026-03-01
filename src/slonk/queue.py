@@ -24,14 +24,14 @@ from typing import Any
 from slonk.constants import _DONE
 
 
-def _queue_iter(q: Queue[Any]) -> Iterator[str]:
+def _queue_iter(q: Queue[Any]) -> Iterator[Any]:
     """Yield items from *q* until the ``_DONE`` sentinel is received.
 
     Args:
-        q: A queue containing string items terminated by ``_DONE``.
+        q: A queue containing items terminated by ``_DONE``.
 
     Yields:
-        Each string item from the queue.
+        Each item from the queue.
 
     Examples:
         >>> from queue import Queue
@@ -77,15 +77,15 @@ class _QueueDrainState:
         self.done = False
 
 
-def _tracked_queue_iter(q: Queue[Any], state: _QueueDrainState) -> Iterator[str]:
+def _tracked_queue_iter(q: Queue[Any], state: _QueueDrainState) -> Iterator[Any]:
     """Like :func:`_queue_iter` but sets *state.done* when ``_DONE`` is consumed.
 
     Args:
-        q: A queue containing string items terminated by ``_DONE``.
+        q: A queue containing items terminated by ``_DONE``.
         state: Shared state flag that will be set when the queue is exhausted.
 
     Yields:
-        Each string item from the queue.
+        Each item from the queue.
     """
     while True:
         item = q.get()

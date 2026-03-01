@@ -405,9 +405,9 @@ class TestRoleProtocols:
         handler = ShellCommandHandler("echo hi")
         assert isinstance(handler, Transform)
 
-    def test_shell_command_handler_is_not_source(self) -> None:
+    def test_shell_command_handler_is_source(self) -> None:
         handler = ShellCommandHandler("echo hi")
-        assert not isinstance(handler, Source)
+        assert isinstance(handler, Source)
 
     def test_shell_command_handler_is_not_sink(self) -> None:
         handler = ShellCommandHandler("echo hi")
@@ -460,7 +460,13 @@ class TestRoleValidation:
 
     def test_transform_only_as_first_stage_no_seed_raises(self) -> None:
         """A Transform-only handler as first stage with no seed data should error."""
-        slonk = Slonk() | "grep foo"
+
+        class TransformOnly:
+            def process_transform(self, input_data: list[str]) -> list[str]:
+                return list(input_data)
+
+        slonk = Slonk()
+        slonk.stages.append(TransformOnly())  # type: ignore[arg-type]
         with pytest.raises(TypeError, match="does not implement Source"):
             list(slonk.run(None))
 
