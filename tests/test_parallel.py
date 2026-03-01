@@ -20,9 +20,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from helpers import TestBase, TestModel
 from slonk import (
-    Base,
-    ExampleModel,
     PathHandler,
     ShellCommandHandler,
     Sink,
@@ -49,17 +48,17 @@ class TestFreeThreadingDetection:
         assert isinstance(result, bool)
 
     def test_is_free_threaded_when_gil_enabled(self) -> None:
-        with patch("slonk.sys") as mock_sys:
+        with patch("slonk.constants.sys") as mock_sys:
             mock_sys._is_gil_enabled.return_value = True
             assert _is_free_threaded() is False
 
     def test_is_free_threaded_when_gil_disabled(self) -> None:
-        with patch("slonk.sys") as mock_sys:
+        with patch("slonk.constants.sys") as mock_sys:
             mock_sys._is_gil_enabled.return_value = False
             assert _is_free_threaded() is True
 
     def test_is_free_threaded_when_no_attribute(self) -> None:
-        with patch("slonk.sys", spec=[]):
+        with patch("slonk.constants.sys", spec=[]):
             assert _is_free_threaded() is False
 
 
@@ -325,7 +324,7 @@ class TestParallelWrapper:
 
         handler = parallel(record_thread, workers=2, chunk_size=2)
 
-        with patch("slonk._is_free_threaded", return_value=True):
+        with patch("slonk.handlers._is_free_threaded", return_value=True):
             result = list(handler.process_transform(["a", "b", "c", "d"]))
 
         assert result == ["a", "b", "c", "d"]
@@ -371,9 +370,9 @@ class TestRoleProtocol:
             connect_args={"check_same_thread": False},
             poolclass=StaticPool,
         )
-        Base.metadata.create_all(engine)
+        TestBase.metadata.create_all(engine)
         sf = sessionmaker(bind=engine)
-        handler = SQLAlchemyHandler(ExampleModel, sf)
+        handler = SQLAlchemyHandler(TestModel, sf)
         assert isinstance(handler, Source)
 
     def test_sqlalchemy_handler_is_not_transform(self) -> None:
@@ -382,9 +381,9 @@ class TestRoleProtocol:
             connect_args={"check_same_thread": False},
             poolclass=StaticPool,
         )
-        Base.metadata.create_all(engine)
+        TestBase.metadata.create_all(engine)
         sf = sessionmaker(bind=engine)
-        handler = SQLAlchemyHandler(ExampleModel, sf)
+        handler = SQLAlchemyHandler(TestModel, sf)
         assert not isinstance(handler, Transform)
 
     def test_callable_transform_is_transform(self) -> None:
@@ -520,14 +519,14 @@ class TestSQLAlchemyHandlerStreaming:
             connect_args={"check_same_thread": False},
             poolclass=StaticPool,
         )
-        Base.metadata.create_all(engine)
+        TestBase.metadata.create_all(engine)
         sf = sessionmaker(bind=engine)
         session = sf()
         session.add_all(
             [
-                ExampleModel(id="1", data="Alpha"),
-                ExampleModel(id="2", data="Beta"),
-                ExampleModel(id="3", data="Gamma"),
+                TestModel(id="1", data="Alpha"),
+                TestModel(id="2", data="Beta"),
+                TestModel(id="3", data="Gamma"),
             ]
         )
         session.commit()
@@ -537,14 +536,14 @@ class TestSQLAlchemyHandlerStreaming:
     @pytest.mark.parallel_only()
     def test_source_yields_rows(self, setup_db: sessionmaker) -> None:
         """process_source yields formatted rows via yield_per."""
-        handler = SQLAlchemyHandler(ExampleModel, setup_db)
+        handler = SQLAlchemyHandler(TestModel, setup_db)
         result = list(handler.process_source())
         assert result == ["1\tAlpha", "2\tBeta", "3\tGamma"]
 
     @pytest.mark.parallel_only()
     def test_source_in_pipeline(self, setup_db: sessionmaker) -> None:
         """SQLAlchemyHandler streams in a parallel pipeline."""
-        slonk = Slonk(session_factory=setup_db) | ExampleModel
+        slonk = Slonk(session_factory=setup_db) | TestModel
         result = list(slonk.run_parallel())
         # Same data as batch.
         batch_result = list(slonk.run_sync())

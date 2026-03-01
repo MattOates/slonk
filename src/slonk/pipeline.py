@@ -1,0 +1,466 @@
+from __future__ import annotations
+
+import threading
+import time
+from collections.abc import Iterable
+from typing import Any
+
+from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+
+from slonk.base import SlonkBase
+from slonk.constants import _DEFAULT_MAX_QUEUE_SIZE, _KNOWN_PATH_PROTOCOLS
+from slonk.handlers import (
+    PathHandler,
+    ShellCommandHandler,
+    SQLAlchemyHandler,
+    _ParallelHandler,
+    _wrap_callable,
+)
+from slonk.middleware import Middleware, _Event, _EventDispatcher, _EventType
+from slonk.roles import Sink, Source, StageType, Transform, _Role
+from slonk.streaming import _StreamingPipeline
+
+
+def _compute_roles(
+    stages: list[StageType],
+    *,
+    has_seed: bool,
+) -> list[_Role]:
+    """Determine the role each stage should play.
+
+    Raises ``TypeError`` if a stage cannot fulfil its required role.
+    """
+    n = len(stages)
+    if n == 0:
+        return []
+
+    roles: list[_Role] = []
+    for i, stage in enumerate(stages):
+        is_first = i == 0
+        is_last = i == n - 1
+
+        # Slonk sub-pipelines always act as Transform (take input, produce output).
+        is_slonk = isinstance(stage, Slonk)
+
+        if is_first and is_last:
+            # Single-stage pipeline.
+            if has_seed:
+                # Prefer Sink, else Transform.
+                if isinstance(stage, Sink):
+                    roles.append(_Role.SINK)
+                elif isinstance(stage, Transform) or is_slonk:
+                    roles.append(_Role.TRANSFORM)
+                else:
+                    raise TypeError(
+                        f"Stage 0 ({type(stage).__name__}) receives seed data but "
+                        f"implements neither Transform nor Sink."
+                    )
+            else:
+                if isinstance(stage, Source):
+                    roles.append(_Role.SOURCE)
+                else:
+                    raise TypeError(
+                        f"Stage 0 ({type(stage).__name__}) is the first stage with no "
+                        f"seed data but does not implement Source."
+                    )
+        elif is_first:
+            # First of multiple stages.
+            if has_seed:
+                if isinstance(stage, Transform) or is_slonk:
+                    roles.append(_Role.TRANSFORM)
+                else:
+                    raise TypeError(
+                        f"Stage 0 ({type(stage).__name__}) receives seed data but "
+                        f"does not implement Transform."
+                    )
+            else:
+                if isinstance(stage, Source):
+                    roles.append(_Role.SOURCE)
+                else:
+                    raise TypeError(
+                        f"Stage 0 ({type(stage).__name__}) is the first stage with no "
+                        f"seed data but does not implement Source."
+                    )
+        elif is_last:
+            # Last of multiple stages — receives input from previous.
+            if isinstance(stage, Sink):
+                roles.append(_Role.SINK)
+            elif isinstance(stage, Transform) or is_slonk:
+                roles.append(_Role.TRANSFORM)
+            else:
+                raise TypeError(
+                    f"Stage {i} ({type(stage).__name__}) is the last stage but "
+                    f"implements neither Transform nor Sink."
+                )
+        else:
+            # Middle stage.
+            if isinstance(stage, Transform) or is_slonk:
+                roles.append(_Role.TRANSFORM)
+            else:
+                raise TypeError(
+                    f"Stage {i} ({type(stage).__name__}) is a middle stage but "
+                    f"does not implement Transform."
+                )
+
+    return roles
+
+
+class TeeHandler(SlonkBase):
+    """Passes input through unchanged while also running a side pipeline.
+
+    Implements ``Transform`` — materialises input so both the main
+    passthrough and side pipeline can iterate independently.  In the
+    streaming pipeline the stage thread provides natural concurrency.
+    """
+
+    def __init__(self, pipeline: Slonk) -> None:
+        self.pipeline = pipeline
+
+    def process_transform(self, input_data: Iterable[str]) -> Iterable[str]:
+        """Run side pipeline and return original data + side results."""
+        data = list(input_data)
+
+        side_result: list[str] = []
+        error: BaseException | None = None
+
+        def _run_side() -> None:
+            nonlocal side_result, error
+            try:
+                side_result = list(self.pipeline.run_sync(data))
+            except BaseException as exc:
+                error = exc
+
+        t = threading.Thread(target=_run_side, daemon=True)
+        t.start()
+        t.join()
+
+        if error is not None:
+            raise error
+
+        results: list[str] = list(data)
+        results.extend(side_result)
+        return results
+
+
+class Slonk:
+    def __init__(self, session_factory: sessionmaker[Session] | None = None) -> None:
+        self.stages: list[StageType] = []
+        self.session_factory = session_factory
+        self._middleware: list[Middleware] = []
+
+    def __or__(
+        self,
+        other: str | Slonk | type[DeclarativeBase] | _ParallelHandler | Any,
+    ) -> Slonk:
+        if isinstance(other, _ParallelHandler):
+            self.stages.append(other)  # type: ignore[arg-append]
+        elif isinstance(other, str):
+            if self._is_path(other):
+                self.stages.append(PathHandler(other))
+            else:
+                self.stages.append(ShellCommandHandler(other))
+        elif isinstance(other, Slonk):
+            self.stages.append(other)  # type: ignore[arg-type]  # Slonk sub-pipelines act as Transform
+        elif isinstance(other, type) and issubclass(other, DeclarativeBase):
+            if self.session_factory is None:
+                raise ValueError(
+                    "Cannot use SQLAlchemy models without a session_factory. "
+                    "Pass session_factory to Slonk()."
+                )
+            self.stages.append(SQLAlchemyHandler(other, self.session_factory))
+        elif isinstance(other, (Source, Transform, Sink)):
+            self.stages.append(other)
+        elif callable(other):
+            self.stages.append(_wrap_callable(other))
+        else:
+            raise TypeError(f"Unsupported type: {type(other)}")
+        return self
+
+    # ------------------------------------------------------------------
+    # Middleware registration API
+    # ------------------------------------------------------------------
+
+    def add_middleware(self, mw: Middleware) -> Slonk:
+        """Register persistent middleware (runs on every pipeline execution).
+
+        Returns ``self`` for chaining.
+        """
+        self._middleware.append(mw)
+        return self
+
+    def remove_middleware(self, mw: Middleware) -> Slonk:
+        """Remove a previously registered middleware.
+
+        Returns ``self`` for chaining.  Raises ``ValueError`` if not found.
+        """
+        self._middleware.remove(mw)
+        return self
+
+    # ------------------------------------------------------------------
+    # Public execution API
+    # ------------------------------------------------------------------
+
+    def run(
+        self,
+        input_data: Iterable[Any] | None = None,
+        *,
+        parallel: bool = True,
+        max_queue_size: int = _DEFAULT_MAX_QUEUE_SIZE,
+        timeout: float | None = None,
+        middleware: list[Middleware] | None = None,
+    ) -> Iterable[str]:
+        """Run the pipeline.
+
+        Parameters
+        ----------
+        input_data:
+            Seed data fed into the first stage.
+        parallel:
+            When ``True`` (the default) stages execute concurrently in
+            threads connected by bounded queues.  Set to ``False`` for
+            the legacy sequential behaviour.
+        max_queue_size:
+            Backpressure limit between stages (parallel mode only).
+        timeout:
+            Reserved for future use.
+        middleware:
+            Additional middleware for this run only (merged with persistent
+            middleware registered via ``add_middleware()``).
+        """
+        if parallel:
+            return self.run_parallel(
+                input_data, max_queue_size=max_queue_size, middleware=middleware
+            )
+        return self.run_sync(input_data, middleware=middleware)
+
+    def run_sync(
+        self,
+        input_data: Iterable[Any] | None = None,
+        *,
+        middleware: list[Middleware] | None = None,
+    ) -> Iterable[str]:
+        """Run the pipeline sequentially — each stage blocks until complete."""
+        if not self.stages:
+            return list(input_data) if input_data is not None else []
+
+        roles = _compute_roles(self.stages, has_seed=input_data is not None)
+
+        # -- Middleware setup -----------------------------------------------
+        all_mw = self._merge_middleware(middleware)
+        dispatcher = self._start_middleware(all_mw, self.stages, roles)
+
+        pipeline_start = time.monotonic()
+        output: Any = input_data
+
+        try:
+            for i, (stage, role) in enumerate(zip(self.stages, roles, strict=True)):
+                stage_start = time.monotonic()
+                self._emit_stage_start(dispatcher, stage, role, i)
+                try:
+                    if role is _Role.SOURCE:
+                        if isinstance(stage, Source):
+                            output = stage.process_source()
+                        else:
+                            raise TypeError(f"{type(stage).__name__} does not implement Source")
+                    elif role is _Role.TRANSFORM:
+                        if isinstance(stage, Slonk):
+                            output = stage.run_sync(output)
+                        elif isinstance(stage, Transform):
+                            output = stage.process_transform(output)
+                        else:
+                            raise TypeError(f"{type(stage).__name__} does not implement Transform")
+                    elif role is _Role.SINK:
+                        if isinstance(stage, Sink):
+                            stage.process_sink(output)
+                            output = []
+                        else:
+                            raise TypeError(f"{type(stage).__name__} does not implement Sink")
+                    self._emit_stage_end(dispatcher, stage, role, i, stage_start)
+                except BaseException as exc:
+                    self._emit_stage_error(dispatcher, stage, role, i, exc)
+                    raise
+        finally:
+            self._stop_middleware(dispatcher, self.stages, roles, pipeline_start)
+            self._cleanup_stages(self.stages)
+
+        return output if output is not None else []
+
+    def run_parallel(
+        self,
+        input_data: Iterable[Any] | None = None,
+        *,
+        max_queue_size: int = _DEFAULT_MAX_QUEUE_SIZE,
+        middleware: list[Middleware] | None = None,
+    ) -> Iterable[str]:
+        """Run the pipeline with streaming/parallel execution.
+
+        Each stage runs in its own thread.  Bounded queues between stages
+        provide backpressure.  ``TeeHandler`` side-pipelines execute
+        concurrently.
+        """
+        roles = _compute_roles(self.stages, has_seed=input_data is not None)
+
+        # -- Middleware setup -----------------------------------------------
+        all_mw = self._merge_middleware(middleware)
+        dispatcher = self._start_middleware(all_mw, self.stages, roles)
+
+        pipeline_start = time.monotonic()
+        try:
+            sp = _StreamingPipeline(
+                self.stages, roles, max_queue_size=max_queue_size, dispatcher=dispatcher
+            )
+            result = sp.execute(input_data)
+        finally:
+            self._stop_middleware(dispatcher, self.stages, roles, pipeline_start)
+            self._cleanup_stages(self.stages)
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Middleware helpers (private)
+    # ------------------------------------------------------------------
+
+    def _merge_middleware(self, per_run: list[Middleware] | None) -> list[Middleware]:
+        """Merge persistent and per-run middleware lists."""
+        if not self._middleware and not per_run:
+            return []
+        result = list(self._middleware)
+        if per_run:
+            result.extend(per_run)
+        return result
+
+    def _start_middleware(
+        self,
+        all_mw: list[Middleware],
+        stages: list[StageType],
+        roles: list[_Role],
+    ) -> _EventDispatcher | None:
+        """Create and start a dispatcher if middleware exist, wire stages."""
+        if not all_mw:
+            return None
+
+        dispatcher = _EventDispatcher(all_mw)
+        dispatcher.start()
+
+        # Wire event queue and metadata onto SlonkBase stages.
+        for i, (stage, role) in enumerate(zip(stages, roles, strict=True)):
+            if isinstance(stage, SlonkBase):
+                stage._event_queue = dispatcher.queue  # type: ignore[assignment]
+                stage._stage_index = i
+                stage._stage_role = role
+
+        # Emit PIPELINE_START.
+        dispatcher.queue.put(
+            _Event(
+                type=_EventType.PIPELINE_START,
+                stages=list(stages),
+                roles=list(roles),
+            )
+        )
+        return dispatcher
+
+    def _stop_middleware(
+        self,
+        dispatcher: _EventDispatcher | None,
+        stages: list[StageType],
+        roles: list[_Role],
+        pipeline_start: float,
+    ) -> None:
+        """Emit PIPELINE_END, drain the queue, and stop the dispatcher."""
+        if dispatcher is None:
+            return
+        dispatcher.queue.put(
+            _Event(
+                type=_EventType.PIPELINE_END,
+                stages=list(stages),
+                roles=list(roles),
+                duration=time.monotonic() - pipeline_start,
+            )
+        )
+        dispatcher.stop()
+
+    @staticmethod
+    def _cleanup_stages(stages: list[StageType]) -> None:
+        """Clear middleware wiring from stages after execution."""
+        for stage in stages:
+            if isinstance(stage, SlonkBase):
+                stage._event_queue = None
+                stage._stage_index = -1
+                stage._stage_role = _Role.TRANSFORM
+
+    @staticmethod
+    def _emit_stage_start(
+        dispatcher: _EventDispatcher | None,
+        stage: StageType,
+        role: _Role,
+        index: int,
+    ) -> None:
+        if dispatcher is None:
+            return
+        dispatcher.queue.put(
+            _Event(type=_EventType.STAGE_START, stage=stage, role=role, index=index)
+        )
+
+    @staticmethod
+    def _emit_stage_end(
+        dispatcher: _EventDispatcher | None,
+        stage: StageType,
+        role: _Role,
+        index: int,
+        start_time: float,
+    ) -> None:
+        if dispatcher is None:
+            return
+        dispatcher.queue.put(
+            _Event(
+                type=_EventType.STAGE_END,
+                stage=stage,
+                role=role,
+                index=index,
+                duration=time.monotonic() - start_time,
+            )
+        )
+
+    @staticmethod
+    def _emit_stage_error(
+        dispatcher: _EventDispatcher | None,
+        stage: StageType,
+        role: _Role,
+        index: int,
+        error: BaseException,
+    ) -> None:
+        if dispatcher is None:
+            return
+        dispatcher.queue.put(
+            _Event(
+                type=_EventType.STAGE_ERROR,
+                stage=stage,
+                role=role,
+                index=index,
+                error=error,
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+
+    def _is_path(self, string: str) -> bool:
+        """Detect whether a string represents a filesystem path (local or remote)."""
+        if string.startswith(("/", "./", "../")):
+            return True
+        if "://" in string:
+            scheme = string.split("://", 1)[0].lower()
+            return scheme in _KNOWN_PATH_PROTOCOLS
+        return False
+
+    def tee(self, pipeline: Slonk) -> Slonk:
+        tee_stage = TeeHandler(pipeline)
+        self.stages.append(tee_stage)
+        return self
+
+
+def tee(pipeline: Slonk) -> Slonk:
+    s = Slonk()
+    s.tee(pipeline)
+    return s

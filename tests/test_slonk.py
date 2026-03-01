@@ -11,8 +11,6 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from slonk import (
-    Base,
-    ExampleModel,
     PathHandler,
     ShellCommandHandler,
     Sink,
@@ -26,6 +24,8 @@ from slonk import (
 
 if TYPE_CHECKING:
     from conftest import PipelineRunner
+
+from helpers import TestBase, TestModel
 
 
 class TestPathHandler:
@@ -146,15 +146,15 @@ class TestSQLAlchemyHandler:
             connect_args={"check_same_thread": False},
             poolclass=StaticPool,
         )
-        Base.metadata.create_all(engine)
+        TestBase.metadata.create_all(engine)
         Session = sessionmaker(bind=engine)
 
         session = Session()
         session.add_all(
             [
-                ExampleModel(id="1", data="Hello World"),
-                ExampleModel(id="2", data="Goodbye World"),
-                ExampleModel(id="3", data="Test Data"),
+                TestModel(id="1", data="Hello World"),
+                TestModel(id="2", data="Goodbye World"),
+                TestModel(id="3", data="Test Data"),
             ]
         )
         session.commit()
@@ -163,11 +163,11 @@ class TestSQLAlchemyHandler:
         return Session
 
     def test_init(self, setup_db: sessionmaker) -> None:
-        handler = SQLAlchemyHandler(ExampleModel, setup_db)
-        assert handler.model == ExampleModel
+        handler = SQLAlchemyHandler(TestModel, setup_db)
+        assert handler.model == TestModel
 
     def test_process_source(self, setup_db: sessionmaker) -> None:
-        handler = SQLAlchemyHandler(ExampleModel, setup_db)
+        handler = SQLAlchemyHandler(TestModel, setup_db)
         result = list(handler.process_source())
 
         assert len(result) == 3
@@ -268,7 +268,7 @@ class TestSlonk:
 
         assert result == ["prefix_test_suffix"]
 
-    @patch("slonk.UPath")
+    @patch("slonk.handlers.UPath")
     def test_or_with_cloud_path(self, mock_upath: MagicMock) -> None:
         mock_instance = MagicMock()
         mock_upath.return_value = mock_instance
@@ -283,13 +283,13 @@ class TestSlonk:
     def test_or_with_sqlalchemy_model_requires_session(self) -> None:
         slonk = Slonk()
         with pytest.raises(ValueError, match="session_factory"):
-            slonk | ExampleModel
+            slonk | TestModel
 
     def test_or_with_sqlalchemy_model(self) -> None:
         engine = create_engine("sqlite:///:memory:")
         Session = sessionmaker(bind=engine)
         slonk = Slonk(session_factory=Session)
-        result = slonk | ExampleModel
+        result = slonk | TestModel
 
         assert result is slonk
         assert len(slonk.stages) == 1
@@ -360,9 +360,9 @@ class TestRoleProtocols:
             connect_args={"check_same_thread": False},
             poolclass=StaticPool,
         )
-        Base.metadata.create_all(engine)
+        TestBase.metadata.create_all(engine)
         sf = sessionmaker(bind=engine)
-        handler = SQLAlchemyHandler(ExampleModel, sf)
+        handler = SQLAlchemyHandler(TestModel, sf)
         assert isinstance(handler, Source)
 
     def test_sqlalchemy_handler_is_not_transform(self) -> None:
@@ -371,9 +371,9 @@ class TestRoleProtocols:
             connect_args={"check_same_thread": False},
             poolclass=StaticPool,
         )
-        Base.metadata.create_all(engine)
+        TestBase.metadata.create_all(engine)
         sf = sessionmaker(bind=engine)
-        handler = SQLAlchemyHandler(ExampleModel, sf)
+        handler = SQLAlchemyHandler(TestModel, sf)
         assert not isinstance(handler, Transform)
 
     def test_tee_handler_is_transform(self) -> None:
@@ -401,10 +401,10 @@ class TestRoleValidation:
             connect_args={"check_same_thread": False},
             poolclass=StaticPool,
         )
-        Base.metadata.create_all(engine)
+        TestBase.metadata.create_all(engine)
         sf = sessionmaker(bind=engine)
         # SQLAlchemyHandler is Source-only, placing it in the middle should fail
-        handler = SQLAlchemyHandler(ExampleModel, sf)
+        handler = SQLAlchemyHandler(TestModel, sf)
 
         def identity(data: list[str]) -> list[str]:
             return list(data)
@@ -463,7 +463,7 @@ class TestIntegration:
             connect_args={"check_same_thread": False},
             poolclass=StaticPool,
         )
-        Base.metadata.create_all(engine)
+        TestBase.metadata.create_all(engine)
         return sessionmaker(bind=engine)
 
     def test_sql_to_shell_pipeline(
@@ -472,15 +472,15 @@ class TestIntegration:
         session = setup_test_db()
         session.add_all(
             [
-                ExampleModel(id="1", data="Hello World"),
-                ExampleModel(id="2", data="Goodbye World"),
-                ExampleModel(id="3", data="Hello Again"),
+                TestModel(id="1", data="Hello World"),
+                TestModel(id="2", data="Goodbye World"),
+                TestModel(id="3", data="Hello Again"),
             ]
         )
         session.commit()
         session.close()
 
-        slonk = Slonk(session_factory=setup_test_db) | ExampleModel | "grep Hello"
+        slonk = Slonk(session_factory=setup_test_db) | TestModel | "grep Hello"
         result = list(run_pipeline(slonk))
 
         output = "\n".join(result)
