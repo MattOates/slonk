@@ -29,7 +29,7 @@ wraps it in the appropriate handler:
 | String starting with `/`, `./`, `../`, or a known URI scheme | `PathHandler` |
 | Other string | `ShellCommandHandler` |
 | `Slonk` instance | Nested sub-pipeline (acts as Transform) |
-| SQLAlchemy `DeclarativeBase` subclass | `SQLAlchemyHandler` |
+| SQLAlchemy `DeclarativeBase` subclass | `SQLAlchemyHandler` (Source, Transform, or Sink) |
 | `_ParallelHandler` (from `parallel()`) | Used directly |
 | Object implementing `Source`, `Transform`, or `Sink` | Used directly |
 | Other callable | Wrapped via `_wrap_callable()` (role inferred from signature) |

@@ -45,18 +45,56 @@ pipeline = (
 
 ### SQLAlchemyHandler
 
-Queries all rows from a SQLAlchemy model.
+Read, upsert, or bulk-write rows for a SQLAlchemy declarative model.
+Supports all three roles -- the role is assigned automatically based on
+the handler's position in the pipeline.
 
-- **Source**: fetches rows using `yield_per()` for chunked streaming.
+- **Source**: fetches all rows using `yield_per()` for chunked streaming,
+  yielding `"<id>\t<data>"` strings.
+- **Transform**: upserts each incoming `"<id>\t<data>"` row via
+  `session.merge()` and passes data through unchanged.
+- **Sink**: bulk-writes incoming rows with periodic flushes and a single
+  commit at the end.
 
 ```python
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import create_engine, Column, String
+from sqlalchemy.orm import DeclarativeBase, sessionmaker
 from slonk import Slonk
 
-pipeline = Slonk(session_factory=Session) | MyModel
+class Base(DeclarativeBase):
+    pass
+
+class Record(Base):
+    __tablename__ = "records"
+    id = Column(String, primary_key=True)
+    data = Column(String)
+
+engine = create_engine("sqlite:///data.db")
+Session = sessionmaker(bind=engine)
+
+# Source: read all rows
+pipeline = Slonk(session_factory=Session) | Record
+for row in pipeline.run():
+    print(row)  # "1\tsome data"
+
+# Transform: upsert and pass through (middle position)
+pipeline = (
+    Slonk(session_factory=Session)
+    | (lambda: ["10\tnew row", "11\tanother row"])
+    | Record          # upserts each row, yields unchanged
+    | "grep new"      # downstream sees the data
+)
+
+# Sink: efficient bulk write (last position with seed data)
+pipeline = (
+    Slonk(session_factory=Session)
+    | (lambda: ["20\tbulk A", "21\tbulk B"])
+    | Record          # bulk-writes, returns nothing
+)
 ```
 
-Requires passing a `session_factory` to `Slonk()`.
+Requires passing a `session_factory` to `Slonk()`.  The tab-separated
+format (`"<id>\t<data>"`) is the interchange format between stages.
 
 ## Callable wrappers
 
