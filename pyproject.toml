@@ -1,6 +1,6 @@
 [project]
 name = "slonk"
-version = "0.0.1"
+version = "0.1.1"
 description = "Experiment in typed pipelining of data between python, shell and various data sources and sinks."
 authors = [
     { name = "Matt Oates", email = "mattoates+support@gmail.com" }
@@ -10,18 +10,31 @@ dependencies = [
     "sqlalchemy>=2.0.32",
 ]
 readme = "README.md"
-requires-python = ">= 3.8"
+requires-python = ">= 3.12"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-[tool.rye]
-managed = true
-dev-dependencies = []
+[dependency-groups]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+]
 
 [tool.hatch.metadata]
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/slonk"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short --strict-markers"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+]
