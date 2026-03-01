@@ -183,7 +183,7 @@ class _StreamingPipeline:
                     # Sub-pipelines run synchronously on materialised input.
                     items = list(input_stream)
                     drain_state.done = True
-                    result = stage.run_sync(items or None)
+                    result = stage.run_sync(items)
                     if result is not None:
                         for r in result:
                             out_q.put(r)

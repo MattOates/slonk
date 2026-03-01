@@ -96,6 +96,68 @@ pipeline = (
 Requires passing a `session_factory` to `Slonk()`.  The tab-separated
 format (`"<id>\t<data>"`) is the interchange format between stages.
 
+### MergeHandler
+
+Fan-in handler that merges upstream data with output from multiple
+sub-pipelines concurrently — items are interleaved as they become
+available (non-deterministic order).
+
+- **Transform**: runs each sub-pipeline in its own thread, yielding
+  items from any source as soon as they are ready.  Uses a shared
+  bounded queue for backpressure.
+
+Use the `merge()` convenience factory with the pipe operator, or call
+`.merge()` on an existing pipeline:
+
+```python
+from slonk import Slonk, merge
+
+api_data = Slonk() | (lambda: ["api_row1", "api_row2"])
+db_data  = Slonk() | (lambda: ["db_row1", "db_row2"])
+
+# Factory style — merge upstream + sub-pipelines
+pipeline = (
+    Slonk()
+    | (lambda: ["upstream1", "upstream2"])
+    | merge(api_data, db_data)
+)
+result = sorted(pipeline.run())
+# ['api_row1', 'api_row2', 'db_row1', 'db_row2', 'upstream1', 'upstream2']
+```
+
+Because producers run in threads, items from different sources will be
+interleaved.  Use `cat()` instead when deterministic ordering matters.
+
+### CatHandler
+
+Fan-in handler that concatenates upstream data with output from multiple
+sub-pipelines in listed order — all upstream items first, then each
+sub-pipeline sequentially (deterministic order).
+
+- **Transform**: yields upstream items, then iterates each sub-pipeline
+  in turn.  No threads are needed.
+
+Use the `cat()` convenience factory or `.cat()` method:
+
+```python
+from slonk import Slonk, cat
+
+source_a = Slonk() | (lambda: ["a1", "a2"])
+source_b = Slonk() | (lambda: ["b1", "b2"])
+
+pipeline = (
+    Slonk()
+    | (lambda: ["upstream"])
+    | cat(source_a, source_b)
+)
+result = list(pipeline.run())
+# ['upstream', 'a1', 'a2', 'b1', 'b2']
+```
+
+!!! note "Shell-inspired naming"
+    `tee` (fan-out), `merge` (interleaved fan-in), and `cat`
+    (ordered fan-in) mirror their Unix shell counterparts.
+
 ## Callable wrappers
 
 Plain callables are automatically wrapped based on their signature:

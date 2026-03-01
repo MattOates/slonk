@@ -11,6 +11,8 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from slonk import (
+    CatHandler,
+    MergeHandler,
     PathHandler,
     ShellCommandHandler,
     Sink,
@@ -19,6 +21,8 @@ from slonk import (
     SQLAlchemyHandler,
     TeeHandler,
     Transform,
+    cat,
+    merge,
     tee,
 )
 
@@ -590,3 +594,161 @@ class TestIntegration:
         source_result = list(handler.process_source())
         assert "200\tSink Write A" in source_result
         assert "201\tSink Write B" in source_result
+
+
+class TestMergeHandler:
+    """Tests for MergeHandler and the merge() factory."""
+
+    def test_merge_two_sources_with_upstream(self, run_pipeline: PipelineRunner) -> None:
+        """Upstream data + two sub-pipelines are all present in the output."""
+        source_a = Slonk() | (lambda: ["a1", "a2"])
+        source_b = Slonk() | (lambda: ["b1", "b2"])
+
+        pipeline = Slonk() | (lambda: ["upstream1", "upstream2"]) | merge(source_a, source_b)
+        result = sorted(run_pipeline(pipeline))
+
+        assert result == ["a1", "a2", "b1", "b2", "upstream1", "upstream2"]
+
+    def test_merge_empty_upstream(self, run_pipeline: PipelineRunner) -> None:
+        """When upstream produces nothing, only sub-pipeline data is emitted."""
+        source_a = Slonk() | (lambda: ["a1"])
+        source_b = Slonk() | (lambda: ["b1"])
+
+        pipeline = Slonk() | (lambda: []) | merge(source_a, source_b)
+        result = sorted(run_pipeline(pipeline))
+
+        assert result == ["a1", "b1"]
+
+    def test_merge_empty_sub_pipelines(self, run_pipeline: PipelineRunner) -> None:
+        """When sub-pipelines produce nothing, only upstream data is emitted."""
+        empty_a = Slonk() | (lambda: [])
+        empty_b = Slonk() | (lambda: [])
+
+        pipeline = Slonk() | (lambda: ["up1", "up2"]) | merge(empty_a, empty_b)
+        result = sorted(run_pipeline(pipeline))
+
+        assert result == ["up1", "up2"]
+
+    def test_merge_single_sub_pipeline(self, run_pipeline: PipelineRunner) -> None:
+        """Merge with a single sub-pipeline works correctly."""
+        source = Slonk() | (lambda: ["extra"])
+
+        pipeline = Slonk() | (lambda: ["main"]) | merge(source)
+        result = sorted(run_pipeline(pipeline))
+
+        assert result == ["extra", "main"]
+
+    def test_merge_no_sub_pipelines(self, run_pipeline: PipelineRunner) -> None:
+        """Merge with no sub-pipelines is a passthrough."""
+        pipeline = Slonk() | (lambda: ["pass1", "pass2"]) | merge()
+        result = sorted(run_pipeline(pipeline))
+
+        assert result == ["pass1", "pass2"]
+
+    def test_merge_handler_is_transform(self) -> None:
+        """MergeHandler implements the Transform protocol."""
+        handler = MergeHandler()
+        assert isinstance(handler, Transform)
+
+    def test_merge_factory_creates_pipeline(self) -> None:
+        """The merge() factory returns a Slonk with a MergeHandler stage."""
+        pipeline = merge(Slonk() | (lambda: ["a"]))
+        assert len(pipeline.stages) == 1
+        assert isinstance(pipeline.stages[0], MergeHandler)
+
+    def test_merge_method_returns_self(self) -> None:
+        """Slonk.merge() returns self for fluent chaining."""
+        s = Slonk()
+        result = s.merge(Slonk() | (lambda: ["a"]))
+        assert result is s
+
+    def test_merge_error_propagation(self, run_pipeline: PipelineRunner) -> None:
+        """Errors in sub-pipelines propagate to the caller."""
+
+        def fail() -> list[str]:
+            raise RuntimeError("boom")
+
+        failing = Slonk() | fail
+
+        pipeline = Slonk() | (lambda: ["ok"]) | merge(failing)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            list(run_pipeline(pipeline))
+
+
+class TestCatHandler:
+    """Tests for CatHandler and the cat() factory."""
+
+    def test_cat_preserves_order(self, run_pipeline: PipelineRunner) -> None:
+        """Upstream first, then sub-pipelines in listed order."""
+        source_a = Slonk() | (lambda: ["a1", "a2"])
+        source_b = Slonk() | (lambda: ["b1", "b2"])
+
+        pipeline = Slonk() | (lambda: ["upstream1", "upstream2"]) | cat(source_a, source_b)
+        result = list(run_pipeline(pipeline))
+
+        assert result == ["upstream1", "upstream2", "a1", "a2", "b1", "b2"]
+
+    def test_cat_empty_upstream(self, run_pipeline: PipelineRunner) -> None:
+        """When upstream is empty, only sub-pipeline data appears."""
+        source_a = Slonk() | (lambda: ["a1"])
+        source_b = Slonk() | (lambda: ["b1"])
+
+        pipeline = Slonk() | (lambda: []) | cat(source_a, source_b)
+        result = list(run_pipeline(pipeline))
+
+        assert result == ["a1", "b1"]
+
+    def test_cat_empty_sub_pipelines(self, run_pipeline: PipelineRunner) -> None:
+        """When sub-pipelines are empty, only upstream data appears."""
+        empty_a = Slonk() | (lambda: [])
+        empty_b = Slonk() | (lambda: [])
+
+        pipeline = Slonk() | (lambda: ["up1", "up2"]) | cat(empty_a, empty_b)
+        result = list(run_pipeline(pipeline))
+
+        assert result == ["up1", "up2"]
+
+    def test_cat_single_sub_pipeline(self, run_pipeline: PipelineRunner) -> None:
+        """Cat with a single sub-pipeline: upstream then sub-pipeline."""
+        source = Slonk() | (lambda: ["extra"])
+
+        pipeline = Slonk() | (lambda: ["main"]) | cat(source)
+        result = list(run_pipeline(pipeline))
+
+        assert result == ["main", "extra"]
+
+    def test_cat_no_sub_pipelines(self, run_pipeline: PipelineRunner) -> None:
+        """Cat with no sub-pipelines is a passthrough."""
+        pipeline = Slonk() | (lambda: ["pass1", "pass2"]) | cat()
+        result = list(run_pipeline(pipeline))
+
+        assert result == ["pass1", "pass2"]
+
+    def test_cat_handler_is_transform(self) -> None:
+        """CatHandler implements the Transform protocol."""
+        handler = CatHandler()
+        assert isinstance(handler, Transform)
+
+    def test_cat_factory_creates_pipeline(self) -> None:
+        """The cat() factory returns a Slonk with a CatHandler stage."""
+        pipeline = cat(Slonk() | (lambda: ["a"]))
+        assert len(pipeline.stages) == 1
+        assert isinstance(pipeline.stages[0], CatHandler)
+
+    def test_cat_method_returns_self(self) -> None:
+        """Slonk.cat() returns self for fluent chaining."""
+        s = Slonk()
+        result = s.cat(Slonk() | (lambda: ["a"]))
+        assert result is s
+
+    def test_cat_with_downstream_transform(self, run_pipeline: PipelineRunner) -> None:
+        """Cat output can flow into a downstream transform."""
+        source_a = Slonk() | (lambda: ["hello"])
+
+        pipeline = (
+            Slonk() | (lambda: ["world"]) | cat(source_a) | (lambda data: [s.upper() for s in data])
+        )
+        result = list(run_pipeline(pipeline))
+
+        assert result == ["WORLD", "HELLO"]
