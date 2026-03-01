@@ -9,5 +9,8 @@ wheels/
 # venv
 .venv
 
+# mkdocs
+site/
+
 # OS
 .DS_Store

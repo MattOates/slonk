@@ -1,7 +1,7 @@
 UV_VERSION := 0.10.7
 UV := uvx uv@$(UV_VERSION)
 
-.PHONY: test test-verbose test-coverage test-fast clean install-dev help test-unit test-integration lint typecheck
+.PHONY: test test-verbose test-coverage test-fast clean install-dev help test-unit test-integration lint typecheck docs docs-serve
 
 help: ## Show this help message
 	@echo "Available commands:"
@@ -41,3 +41,9 @@ lint: ## Run ruff linter and formatter check
 
 typecheck: ## Run mypy type checker
 	$(UV) run mypy src/
+
+docs: ## Build documentation site
+	$(UV) run --group docs mkdocs build --strict
+
+docs-serve: ## Serve documentation locally for preview
+	$(UV) run --group docs mkdocs serve

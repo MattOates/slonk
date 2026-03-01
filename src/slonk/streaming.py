@@ -1,3 +1,15 @@
+"""Streaming (parallel) pipeline executor.
+
+:class:`_StreamingPipeline` runs each pipeline stage in its own thread,
+connected by bounded :class:`~queue.Queue` instances.  Backpressure is
+automatic — a fast producer blocks when the downstream consumer hasn't
+consumed enough yet.
+
+This module is an internal implementation detail; users interact with
+the streaming executor through :meth:`Slonk.run` (with ``parallel=True``,
+which is the default).
+"""
+
 from __future__ import annotations
 
 import threading
@@ -21,6 +33,12 @@ class _StreamingPipeline:
 
     Bounded queues provide backpressure: a fast producer blocks when the
     downstream consumer hasn't consumed enough yet.
+
+    Args:
+        stages: Ordered list of handler instances.
+        roles: Corresponding role for each stage.
+        max_queue_size: Capacity of the bounded queues between stages.
+        dispatcher: Optional middleware event dispatcher.
     """
 
     def __init__(
@@ -36,6 +54,17 @@ class _StreamingPipeline:
         self.dispatcher = dispatcher
 
     def execute(self, input_data: Iterable[Any] | None) -> list[str]:
+        """Run all stages concurrently and return the final output.
+
+        Args:
+            input_data: Optional seed data for the first stage.
+
+        Returns:
+            Collected output from the last stage.
+
+        Raises:
+            BaseException: Re-raises the first error from any stage thread.
+        """
         if not self.stages:
             return list(input_data) if input_data is not None else []
 
@@ -107,9 +136,20 @@ class _StreamingPipeline:
         """Worker: read from *in_q*, run the stage, push results to *out_q*.
 
         Dispatch is based on the pre-computed *role*:
-        - SOURCE: ignore input queue (drain it), call ``process_source()``.
-        - TRANSFORM: pass a lazy queue iterator to ``process_transform()``.
-        - SINK: pass a lazy queue iterator to ``process_sink()``.
+
+        - ``SOURCE``: ignore input queue (drain it), call ``process_source()``.
+        - ``TRANSFORM``: pass a lazy queue iterator to ``process_transform()``.
+        - ``SINK``: pass a lazy queue iterator to ``process_sink()``.
+
+        Args:
+            stage: The handler instance.
+            role: Its assigned role.
+            index: Zero-based position in the pipeline.
+            in_q: Input queue to read from.
+            out_q: Output queue to push results to.
+            errors: Shared error list protected by *lock*.
+            lock: Threading lock for error list access.
+            dispatcher: Optional middleware event dispatcher.
         """
         # Import here to avoid circular import — Slonk references
         # _StreamingPipeline, and _StreamingPipeline._run_stage needs Slonk

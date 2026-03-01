@@ -1,3 +1,28 @@
+"""Core pipeline orchestrator and public API.
+
+This module contains the :class:`Slonk` class — the main entry point for
+building and running typed data pipelines.  Stages are composed using the
+``|`` operator and executed with :meth:`Slonk.run`.
+
+It also provides:
+
+* :class:`TeeHandler` — fork data to a side-pipeline while passing it through.
+* :func:`tee` — convenience factory that creates a ``TeeHandler``-bearing pipeline.
+* :func:`_compute_roles` — assign :class:`~slonk.roles._Role` to each stage.
+
+Examples:
+    Build and run a simple pipeline:
+
+    >>> from slonk.pipeline import Slonk
+    >>> p = (
+    ...     Slonk()
+    ...     | (lambda: ["hello", "world"])
+    ...     | (lambda data: [s.upper() for s in data])
+    ... )
+    >>> sorted(p.run(parallel=False))
+    ['HELLO', 'WORLD']
+"""
+
 from __future__ import annotations
 
 import threading
@@ -28,7 +53,27 @@ def _compute_roles(
 ) -> list[_Role]:
     """Determine the role each stage should play.
 
-    Raises ``TypeError`` if a stage cannot fulfil its required role.
+    Inspects each stage's protocol conformance and position to assign
+    :class:`~slonk.roles._Role` values.
+
+    Args:
+        stages: The ordered list of handler instances.
+        has_seed: Whether the caller supplied seed data.
+
+    Returns:
+        A list of roles, one per stage.
+
+    Raises:
+        TypeError: If a stage cannot fulfil its required role.
+
+    Examples:
+        >>> from slonk.pipeline import _compute_roles
+        >>> from slonk.roles import _Role, Source
+        >>> class Src:
+        ...     def process_source(self):
+        ...         return []
+        >>> _compute_roles([Src()], has_seed=False)
+        [<_Role.SOURCE: 'source'>]
     """
     n = len(stages)
     if n == 0:
@@ -108,16 +153,29 @@ def _compute_roles(
 class TeeHandler(SlonkBase):
     """Passes input through unchanged while also running a side pipeline.
 
-    Implements ``Transform`` — materialises input so both the main
-    passthrough and side pipeline can iterate independently.  In the
-    streaming pipeline the stage thread provides natural concurrency.
+    Implements :class:`~slonk.roles.Transform` — materialises input so
+    both the main passthrough and side pipeline can iterate independently.
+    In the streaming pipeline the stage thread provides natural concurrency.
+
+    Args:
+        pipeline: The side :class:`Slonk` pipeline to execute.
     """
 
     def __init__(self, pipeline: Slonk) -> None:
         self.pipeline = pipeline
 
     def process_transform(self, input_data: Iterable[str]) -> Iterable[str]:
-        """Run side pipeline and return original data + side results."""
+        """Run side pipeline and return original data plus side results.
+
+        The input is materialised into a list so that both the passthrough
+        and the side pipeline can iterate it independently.
+
+        Args:
+            input_data: Items from the upstream stage.
+
+        Returns:
+            Original items followed by any output from the side pipeline.
+        """
         data = list(input_data)
 
         side_result: list[str] = []
@@ -143,6 +201,32 @@ class TeeHandler(SlonkBase):
 
 
 class Slonk:
+    """The main pipeline builder and executor.
+
+    Construct a pipeline by chaining stages with the ``|`` operator.
+    Stages can be strings (paths or shell commands), callables,
+    SQLAlchemy model classes, :class:`~slonk.handlers._ParallelHandler`
+    wrappers, protocol-conforming handler objects, or nested
+    :class:`Slonk` sub-pipelines.
+
+    Args:
+        session_factory: Optional SQLAlchemy session factory, required
+            when piping declarative model classes.
+
+    Examples:
+        Build a simple pipeline with lambdas:
+
+        >>> p = Slonk() | (lambda: ["a", "b"]) | (lambda data: [s.upper() for s in data])
+        >>> sorted(p.run(parallel=False))
+        ['A', 'B']
+
+        Pipe with seed data:
+
+        >>> p = Slonk() | (lambda data: [s + "!" for s in data])
+        >>> sorted(p.run(["hi", "there"], parallel=False))
+        ['hi!', 'there!']
+    """
+
     def __init__(self, session_factory: sessionmaker[Session] | None = None) -> None:
         self.stages: list[StageType] = []
         self.session_factory = session_factory
@@ -152,6 +236,32 @@ class Slonk:
         self,
         other: str | Slonk | type[DeclarativeBase] | _ParallelHandler | Any,
     ) -> Slonk:
+        """Append a stage to the pipeline using the ``|`` operator.
+
+        The *other* operand is automatically wrapped in the appropriate
+        handler based on its type:
+
+        - ``str`` starting with ``/``, ``./``, ``../``, or a known URI
+          scheme -> :class:`~slonk.handlers.PathHandler`
+        - Other ``str`` -> :class:`~slonk.handlers.ShellCommandHandler`
+        - :class:`Slonk` instance -> nested sub-pipeline (Transform)
+        - SQLAlchemy :class:`~sqlalchemy.orm.DeclarativeBase` subclass ->
+          :class:`~slonk.handlers.SQLAlchemyHandler`
+        - :class:`~slonk.handlers._ParallelHandler` -> used directly
+        - :class:`~slonk.roles.Source` / :class:`~slonk.roles.Transform` /
+          :class:`~slonk.roles.Sink` protocol object -> used directly
+        - Other callable -> wrapped via :func:`~slonk.handlers._wrap_callable`
+
+        Args:
+            other: The stage to append.
+
+        Returns:
+            ``self`` for fluent chaining.
+
+        Raises:
+            TypeError: If *other* is not a supported type.
+            ValueError: If a SQLAlchemy model is used without a session factory.
+        """
         if isinstance(other, _ParallelHandler):
             self.stages.append(other)  # type: ignore[arg-append]
         elif isinstance(other, str):
@@ -183,7 +293,19 @@ class Slonk:
     def add_middleware(self, mw: Middleware) -> Slonk:
         """Register persistent middleware (runs on every pipeline execution).
 
-        Returns ``self`` for chaining.
+        Args:
+            mw: The middleware instance to register.
+
+        Returns:
+            ``self`` for fluent chaining.
+
+        Examples:
+            >>> from slonk.pipeline import Slonk
+            >>> from slonk.builtin_middleware import TimingMiddleware
+            >>> p = Slonk()
+            >>> tm = TimingMiddleware()
+            >>> p.add_middleware(tm) is p
+            True
         """
         self._middleware.append(mw)
         return self
@@ -191,7 +313,14 @@ class Slonk:
     def remove_middleware(self, mw: Middleware) -> Slonk:
         """Remove a previously registered middleware.
 
-        Returns ``self`` for chaining.  Raises ``ValueError`` if not found.
+        Args:
+            mw: The middleware instance to remove.
+
+        Returns:
+            ``self`` for fluent chaining.
+
+        Raises:
+            ValueError: If *mw* is not currently registered.
         """
         self._middleware.remove(mw)
         return self
@@ -211,21 +340,20 @@ class Slonk:
     ) -> Iterable[str]:
         """Run the pipeline.
 
-        Parameters
-        ----------
-        input_data:
-            Seed data fed into the first stage.
-        parallel:
-            When ``True`` (the default) stages execute concurrently in
-            threads connected by bounded queues.  Set to ``False`` for
-            the legacy sequential behaviour.
-        max_queue_size:
-            Backpressure limit between stages (parallel mode only).
-        timeout:
-            Reserved for future use.
-        middleware:
-            Additional middleware for this run only (merged with persistent
-            middleware registered via ``add_middleware()``).
+        Args:
+            input_data: Seed data fed into the first stage.
+            parallel: When ``True`` (the default) stages execute
+                concurrently in threads connected by bounded queues.
+                Set to ``False`` for sequential behaviour.
+            max_queue_size: Backpressure limit between stages
+                (parallel mode only).
+            timeout: Reserved for future use.
+            middleware: Additional middleware for this run only (merged
+                with persistent middleware registered via
+                :meth:`add_middleware`).
+
+        Returns:
+            The pipeline output as an iterable of strings.
         """
         if parallel:
             return self.run_parallel(
@@ -239,7 +367,15 @@ class Slonk:
         *,
         middleware: list[Middleware] | None = None,
     ) -> Iterable[str]:
-        """Run the pipeline sequentially — each stage blocks until complete."""
+        """Run the pipeline sequentially — each stage blocks until complete.
+
+        Args:
+            input_data: Seed data fed into the first stage.
+            middleware: Additional per-run middleware.
+
+        Returns:
+            The pipeline output as an iterable of strings.
+        """
         if not self.stages:
             return list(input_data) if input_data is not None else []
 
@@ -295,8 +431,16 @@ class Slonk:
         """Run the pipeline with streaming/parallel execution.
 
         Each stage runs in its own thread.  Bounded queues between stages
-        provide backpressure.  ``TeeHandler`` side-pipelines execute
+        provide backpressure.  :class:`TeeHandler` side-pipelines execute
         concurrently.
+
+        Args:
+            input_data: Seed data fed into the first stage.
+            max_queue_size: Backpressure limit between stages.
+            middleware: Additional per-run middleware.
+
+        Returns:
+            The pipeline output as a list of strings.
         """
         roles = _compute_roles(self.stages, has_seed=input_data is not None)
 
@@ -395,6 +539,7 @@ class Slonk:
         role: _Role,
         index: int,
     ) -> None:
+        """Push a STAGE_START event to the dispatcher."""
         if dispatcher is None:
             return
         dispatcher.queue.put(
@@ -409,6 +554,7 @@ class Slonk:
         index: int,
         start_time: float,
     ) -> None:
+        """Push a STAGE_END event to the dispatcher."""
         if dispatcher is None:
             return
         dispatcher.queue.put(
@@ -429,6 +575,7 @@ class Slonk:
         index: int,
         error: BaseException,
     ) -> None:
+        """Push a STAGE_ERROR event to the dispatcher."""
         if dispatcher is None:
             return
         dispatcher.queue.put(
@@ -446,7 +593,24 @@ class Slonk:
     # ------------------------------------------------------------------
 
     def _is_path(self, string: str) -> bool:
-        """Detect whether a string represents a filesystem path (local or remote)."""
+        """Detect whether a string represents a filesystem path (local or remote).
+
+        Args:
+            string: The string to test.
+
+        Returns:
+            ``True`` if the string looks like a path or URI.
+
+        Examples:
+            >>> from slonk.pipeline import Slonk
+            >>> s = Slonk()
+            >>> s._is_path("/tmp/file.txt")
+            True
+            >>> s._is_path("s3://bucket/key")
+            True
+            >>> s._is_path("grep hello")
+            False
+        """
         if string.startswith(("/", "./", "../")):
             return True
         if "://" in string:
@@ -455,12 +619,34 @@ class Slonk:
         return False
 
     def tee(self, pipeline: Slonk) -> Slonk:
+        """Fork data to a side pipeline while passing it through.
+
+        The side pipeline receives a copy of the data at this point in
+        the main pipeline.  The main pipeline's output includes both
+        the original data and any output from the side pipeline.
+
+        Args:
+            pipeline: The side :class:`Slonk` pipeline.
+
+        Returns:
+            ``self`` for fluent chaining.
+        """
         tee_stage = TeeHandler(pipeline)
         self.stages.append(tee_stage)
         return self
 
 
 def tee(pipeline: Slonk) -> Slonk:
+    """Convenience factory: create a new :class:`Slonk` with a tee stage.
+
+    Equivalent to ``Slonk().tee(pipeline)``.
+
+    Args:
+        pipeline: The side pipeline to fork data into.
+
+    Returns:
+        A new :class:`Slonk` containing a single :class:`TeeHandler` stage.
+    """
     s = Slonk()
     s.tee(pipeline)
     return s

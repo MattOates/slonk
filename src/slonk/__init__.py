@@ -1,4 +1,22 @@
-"""Slonk — typed data pipelines with operator-overloaded ``|`` syntax."""
+"""Slonk — typed data pipelines with operator-overloaded ``|`` syntax.
+
+Slonk lets you build data pipelines by chaining stages with the ``|``
+operator.  Stages can be plain callables, shell commands (strings),
+file paths, SQLAlchemy models, or custom handler objects that implement
+the :class:`Source`, :class:`Transform`, or :class:`Sink` protocols.
+
+Quick start::
+
+    from slonk import Slonk
+
+    result = (
+        Slonk()
+        | (lambda: ["hello", "world"])
+        | (lambda data: [s.upper() for s in data])
+    ).run(parallel=False)
+
+See the :class:`Slonk` class for full API documentation.
+"""
 
 from __future__ import annotations
 
