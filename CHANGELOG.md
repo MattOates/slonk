@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.2.0 (2026-03-01)
+
+### Bug Fixes
+
+- Resolve SIM212 ruff lint in test_edge_cases.py
+  ([`96fdd25`](https://github.com/MattOates/slonk/commit/96fdd25c4a923bd6fb336789fac2e6c4932031ba))
+
+### Features
+
+- Extend SQLAlchemyHandler with Transform and Sink roles, add data engineering docs
+  ([`1dc18d2`](https://github.com/MattOates/slonk/commit/1dc18d2a4ae37564ec23b21939f9dfb0f9f7d2a3))
+
+
 ## v0.1.1 (2026-03-01)
 
 ### Feature
