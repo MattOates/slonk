@@ -375,8 +375,9 @@ class TestIntegration:
 
             result = list(run_pipeline(slonk, ["line1", "line2"]))
 
-            assert len(result) == 1
-            output = result[0]
+            # Sync mode: batch ShellCommandHandler returns one combined string.
+            # Parallel mode: streaming ShellCommandHandler yields one line per item.
+            output = "\n".join(result)
             assert ">> line1" in output
             assert ">> line2" in output
 
@@ -410,8 +411,9 @@ class TestIntegration:
         slonk = Slonk(session_factory=setup_test_db) | ExampleModel | "grep Hello"
         result = list(run_pipeline(slonk))
 
-        assert len(result) == 1
-        output = result[0]
+        # Sync mode: batch ShellCommandHandler returns one combined string.
+        # Parallel mode: streaming ShellCommandHandler yields one line per item.
+        output = "\n".join(result)
         assert "Hello World" in output
         assert "Hello Again" in output
         assert "Goodbye World" not in output

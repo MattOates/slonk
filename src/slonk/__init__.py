@@ -1,13 +1,14 @@
+import contextlib
 import subprocess
 import sys
 import threading
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from queue import Queue
 from typing import Any, Protocol, Union, runtime_checkable
 
 import cloudpickle
-from sqlalchemy import Column, String, create_engine
+from sqlalchemy import Column, String, create_engine, select
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 from upath import UPath
 
@@ -19,6 +20,7 @@ __all__ = [
     "SQLAlchemyHandler",
     "ShellCommandHandler",
     "Slonk",
+    "StreamingHandler",
     "TeeHandler",
     "parallel",
     "tee",
@@ -61,6 +63,10 @@ _KNOWN_PATH_PROTOCOLS = frozenset(
 # Sentinel signalling end-of-stream between threaded stages.
 _DONE = object()
 
+# Sentinel placed *before* _DONE when the original input_data was None.
+# Allows streaming stages to distinguish "no input" from "empty input".
+_NONE_INPUT = object()
+
 # Default bounded-queue size for streaming pipeline backpressure.
 _DEFAULT_MAX_QUEUE_SIZE = 1024
 
@@ -98,7 +104,7 @@ class ExampleModel(Base):
 
 
 # ---------------------------------------------------------------------------
-# Handler protocol
+# Handler protocols
 # ---------------------------------------------------------------------------
 
 
@@ -107,16 +113,137 @@ class Handler(Protocol):
     def process(self, input_data: Iterable[str] | None) -> Iterable[str]: ...
 
 
+@runtime_checkable
+class StreamingHandler(Handler, Protocol):
+    """A handler that can process items lazily via an iterator.
+
+    ``process_stream`` receives a lazy iterable (which may be backed by a
+    queue) and yields result items one at a time.  The pipeline pushes each
+    yielded item to the next stage immediately, enabling true item-level
+    streaming and backpressure.
+
+    Every ``StreamingHandler`` must also implement ``process`` for use by
+    the synchronous ``run_sync()`` path.  A simple implementation is::
+
+        def process(self, input_data):
+            return list(self.process_stream(input_data))
+    """
+
+    def process_stream(self, input_stream: Iterable[str] | None) -> Iterator[str]: ...
+
+
+# ---------------------------------------------------------------------------
+# Queue iteration helpers
+# ---------------------------------------------------------------------------
+
+
+def _queue_iter(q: Queue[Any]) -> Iterator[str]:
+    """Yield items from *q* until the ``_DONE`` sentinel is received.
+
+    The ``_NONE_INPUT`` sentinel (if present) is silently skipped so that
+    callers always see a clean stream of data items.
+    """
+    while True:
+        item = q.get()
+        if item is _DONE:
+            return
+        if item is _NONE_INPUT:
+            continue
+        yield item
+
+
+class _QueueDrainState:
+    """Mutable flag shared between ``_queue_to_stream_input`` and ``_run_stage``.
+
+    Set to ``True`` once the ``_DONE`` sentinel has been consumed from the
+    input queue, so the error handler in ``_run_stage`` knows not to call
+    ``_drain_queue`` on an already-empty queue (which would deadlock).
+    """
+
+    __slots__ = ("done",)
+
+    def __init__(self) -> None:
+        self.done = False
+
+
+def _queue_to_stream_input(
+    q: Queue[Any],
+    state: _QueueDrainState,
+) -> Iterable[str] | None:
+    """Read the input queue and return either ``None`` or a lazy iterator.
+
+    Returns ``None`` when the original ``input_data`` was ``None``
+    (signalled by the ``_NONE_INPUT`` sentinel), allowing streaming
+    handlers to distinguish "no input" from "empty input".
+    Otherwise returns an iterator that lazily drains the queue.
+
+    *state.done* is set to ``True`` once ``_DONE`` has been consumed
+    (immediately for ``None``/empty-input cases, or lazily once the
+    returned iterator is exhausted).
+    """
+    first = q.get()
+
+    # Original input was None.
+    if first is _NONE_INPUT:
+        # Consume the trailing _DONE.
+        q.get()  # _DONE
+        state.done = True
+        return None
+
+    # Empty input (just _DONE, no data items).
+    if first is _DONE:
+        state.done = True
+        return iter(())  # empty iterator, not None
+
+    # Normal: chain the first item with the rest of the queue.
+    def _iter() -> Iterator[str]:
+        yield first
+        while True:
+            item = q.get()
+            if item is _DONE:
+                state.done = True
+                return
+            if item is _NONE_INPUT:
+                continue
+            yield item
+
+    return _iter()
+
+
+def _drain_queue(q: Queue[Any], *, already_done: bool = False) -> None:
+    """Consume all remaining items from *q* (including ``_DONE``).
+
+    Used to unblock upstream stages when a downstream stage errors
+    mid-stream.
+
+    When *already_done* is ``True`` the queue has already had its
+    ``_DONE`` sentinel consumed and is known to be empty, so this is
+    a no-op.
+    """
+    if already_done:
+        return
+    while True:
+        item = q.get()
+        if item is _DONE:
+            return
+
+
 # ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
 
 
 class PathHandler:
-    """Unified path handler for local and remote filesystems via UPath."""
+    """Unified path handler for local and remote filesystems via UPath.
+
+    Implements ``StreamingHandler`` — file reads yield lines lazily and
+    writes stream items to disk as they arrive.
+    """
 
     def __init__(self, path: str) -> None:
         self.upath = UPath(path)
+
+    # -- batch (Handler) ---------------------------------------------------
 
     def process(self, input_data: Iterable[str] | None) -> Iterable[str]:
         if input_data is not None:
@@ -124,6 +251,33 @@ class PathHandler:
             return input_data
         else:
             return self.read()
+
+    # -- streaming (StreamingHandler) --------------------------------------
+
+    def process_stream(self, input_stream: Iterable[str] | None) -> Iterator[str]:
+        if input_stream is not None:
+            yield from self._write_stream(input_stream)
+        else:
+            yield from self._read_stream()
+
+    def _write_stream(self, data: Iterable[str]) -> Iterator[str]:
+        """Write items to the file, yielding each item as pass-through."""
+        with self.upath.open("w") as file:
+            for line in data:
+                file.write(line + "\n")
+                yield line
+
+    def _read_stream(self) -> Iterator[str]:
+        """Yield lines from the file one at a time.
+
+        Lines include trailing newlines to match the batch ``read()`` output
+        (``file.readlines()``), ensuring that pipelines produce identical
+        results regardless of sync vs parallel mode.
+        """
+        with self.upath.open("r") as file:
+            yield from file
+
+    # -- legacy convenience methods ----------------------------------------
 
     def write(self, data: Iterable[str]) -> None:
         with self.upath.open("w") as file:
@@ -136,8 +290,18 @@ class PathHandler:
 
 
 class ShellCommandHandler:
+    """Runs a shell command, piping data through stdin/stdout.
+
+    Implements ``StreamingHandler`` — stdin is fed from the input stream
+    via a writer thread, and stdout lines are yielded as they arrive.
+    The shell command itself decides how much to buffer (e.g. ``grep``
+    streams line-by-line, ``sort`` buffers until EOF).
+    """
+
     def __init__(self, command: str) -> None:
         self.command = command
+
+    # -- batch (Handler) ---------------------------------------------------
 
     def process(self, input_data: Iterable[str] | None) -> Iterable[str]:
         if input_data is not None:
@@ -145,6 +309,60 @@ class ShellCommandHandler:
             return [self._run_command(input_string)]
         else:
             return []
+
+    # -- streaming (StreamingHandler) --------------------------------------
+
+    def process_stream(self, input_stream: Iterable[str] | None) -> Iterator[str]:
+        if input_stream is None:
+            return
+
+        proc = subprocess.Popen(
+            self.command,
+            shell=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        writer_error: BaseException | None = None
+
+        def _feed_stdin() -> None:
+            """Write input items to the process's stdin, then close it."""
+            nonlocal writer_error
+            try:
+                assert proc.stdin is not None
+                for item in input_stream:
+                    proc.stdin.write((item + "\n").encode())
+                proc.stdin.close()
+            except BaseException as exc:
+                writer_error = exc
+                # Still close stdin so the process doesn't hang.
+                if proc.stdin is not None:
+                    with contextlib.suppress(OSError):
+                        proc.stdin.close()
+
+        writer = threading.Thread(target=_feed_stdin, daemon=True)
+        writer.start()
+
+        # Yield stdout lines as they arrive.
+        assert proc.stdout is not None
+        for raw_line in proc.stdout:
+            line = raw_line.decode().rstrip("\n")
+            if line:
+                yield line
+
+        writer.join()
+        proc.wait()
+
+        if writer_error is not None:
+            raise writer_error
+
+        if proc.returncode != 0:
+            assert proc.stderr is not None
+            stderr = proc.stderr.read().decode()
+            raise RuntimeError(f"Command failed with error: {stderr}")
+
+    # -- legacy helper (used by batch process) -----------------------------
 
     def _run_command(self, input_string: str) -> str:
         process = subprocess.Popen(
@@ -161,15 +379,38 @@ class ShellCommandHandler:
 
 
 class SQLAlchemyHandler:
+    """Queries all rows from a SQLAlchemy model and formats them as strings.
+
+    Implements ``StreamingHandler`` — uses ``yield_per()`` to fetch rows
+    in chunks from the database, yielding formatted strings one at a time
+    instead of materialising the entire result set in memory.
+    """
+
+    _YIELD_PER_CHUNK = 100
+
     def __init__(self, model: type[Base], session_factory: sessionmaker[Session]) -> None:
         self.model = model
         self.session_factory = session_factory
+
+    # -- batch (Handler) ---------------------------------------------------
 
     def process(self, input_data: Iterable[Any] | None) -> Iterable[str]:
         session = self.session_factory()
         try:
             records = session.query(self.model).all()
             return [f"{record.id}\t{record.data}" for record in records]  # type: ignore[attr-defined]
+        finally:
+            session.close()
+
+    # -- streaming (StreamingHandler) --------------------------------------
+
+    def process_stream(self, input_stream: Iterable[str] | None) -> Iterator[str]:
+        """Yield formatted rows using chunked fetching via ``yield_per``."""
+        session = self.session_factory()
+        try:
+            stmt = select(self.model)
+            for record in session.execute(stmt).yield_per(self._YIELD_PER_CHUNK).scalars():
+                yield f"{record.id}\t{record.data}"  # type: ignore[attr-defined]
         finally:
             session.close()
 
@@ -369,6 +610,8 @@ class _StreamingPipeline:
         if input_data is not None:
             for item in input_data:
                 queues[0].put(item)
+        else:
+            queues[0].put(_NONE_INPUT)
         queues[0].put(_DONE)
 
         # Drain the final output queue.
@@ -397,42 +640,50 @@ class _StreamingPipeline:
         errors: list[BaseException],
         lock: threading.Lock,
     ) -> None:
-        """Worker: drain *in_q*, run the stage, push results to *out_q*."""
+        """Worker: read from *in_q*, run the stage, push results to *out_q*.
+
+        Dispatch order:
+
+        1. ``StreamingHandler`` — the stage receives a lazy iterator (or
+           ``None``) over the input queue and yields results one at a
+           time.  This is the true streaming path.
+        2. ``TeeHandler`` — special handling for concurrent side-pipelines.
+        3. ``Slonk`` (sub-pipeline) — runs synchronously on the
+           materialised input.
+        4. Any other ``Handler`` — batch: materialise input, call
+           ``process()``, iterate the result (generators stream naturally).
+        """
+        # Shared flag — set to True once _DONE has been consumed from in_q,
+        # either eagerly (batch path) or lazily (streaming iterator,
+        # possibly in a child thread like ShellCommandHandler's writer).
+        drain_state = _QueueDrainState()
         try:
-            # Materialise all input from the queue (stages expect a full iterable).
-            items: list[Any] = []
-            while True:
-                item = in_q.get()
-                if item is _DONE:
-                    break
-                items.append(item)
-
-            input_data: list[Any] | None = items if items else (items or None)
-            # Distinguish "no items because upstream was empty list" from
-            # "no items because there was no input at all".  We pass [] when
-            # items is empty but was fed, and None only when the *first* stage
-            # received no seed data.  Since the caller always seeds _DONE
-            # after any (possibly zero) items, we treat empty items as [].
-            if not items:
-                # For the first stage it's possible that input_data was None
-                # (caller had None).  But we already put _DONE, so items will
-                # be [].  We want to pass [] so handlers that branch on None
-                # (PathHandler read vs. write) still behave.  The only time
-                # we want None is when the very first queue was seeded with
-                # *only* _DONE and the original input_data was None.
-                input_data = items  # i.e. []
-
-            if isinstance(stage, Slonk):
-                result = stage.run_sync(input_data if input_data else None)
-            elif isinstance(stage, TeeHandler):
-                result = stage.process_parallel(input_data if input_data else None)
+            if isinstance(stage, StreamingHandler):
+                # True streaming: pass None or a lazy queue iterator.
+                input_stream = _queue_to_stream_input(in_q, drain_state)
+                for item in stage.process_stream(input_stream):
+                    out_q.put(item)
             else:
-                result = stage.process(input_data if input_data else None)
+                # Batch path: materialise all input from the queue first.
+                items: list[Any] = list(_queue_iter(in_q))
+                drain_state.done = True  # _queue_iter consumed through _DONE
+                input_data: list[Any] | None = items or None
 
-            if result is not None:
-                for r in result:
-                    out_q.put(r)
+                if isinstance(stage, Slonk):
+                    result = stage.run_sync(input_data)
+                elif isinstance(stage, TeeHandler):
+                    result = stage.process_parallel(input_data)
+                else:
+                    result = stage.process(input_data)
+
+                if result is not None:
+                    for r in result:
+                        out_q.put(r)
         except BaseException as exc:
+            # Drain remaining input so upstream stages don't block forever
+            # on a full queue — but only if we haven't already consumed
+            # everything (otherwise we'd block on an empty queue).
+            _drain_queue(in_q, already_done=drain_state.done)
             with lock:
                 errors.append(exc)
         finally:

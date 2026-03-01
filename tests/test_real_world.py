@@ -108,9 +108,10 @@ class TestRealWorldScenarios:
 
             result = list(run_pipeline(slonk))
 
-            # If diff returns empty output, files are identical
-            assert len(result) == 1
-            assert result[0] == ""  # diff returns empty string for identical files
+            # diff returns empty output when files are identical.
+            # Sync mode: batch ShellCommandHandler returns [""] (one empty string).
+            # Parallel mode: streaming ShellCommandHandler yields nothing ([]).
+            assert all(r.strip() == "" for r in result)
 
             # Verify backup file exists and has correct content
             assert os.path.exists(backup_file)
