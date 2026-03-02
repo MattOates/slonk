@@ -24,11 +24,28 @@ connected by bounded `queue.Queue` instances:
 result = pipeline.run(
     parallel=True,           # default
     max_queue_size=1024,     # queue capacity (default)
+    timeout=30.0,            # wall-clock seconds (default: None = no limit)
 )
 ```
 
 Reduce `max_queue_size` to limit memory usage for large pipelines, or
 increase it to reduce contention for bursty workloads.
+
+### Timeout
+
+Set `timeout` to limit how long a parallel pipeline may run.  If the
+pipeline does not complete within the given number of seconds, a
+`TimeoutError` is raised:
+
+```python
+try:
+    result = pipeline.run(timeout=10.0)
+except TimeoutError:
+    print("Pipeline did not finish in time")
+```
+
+The timeout only applies in parallel mode.  In sequential mode the
+`timeout` parameter is ignored.
 
 ## Sequential mode
 

@@ -195,6 +195,158 @@ pipeline = (
 pipeline.run()
 ```
 
+## Filter: keep only matching items
+
+Use `filter()` to select items based on a predicate -- similar to
+Python's built-in `filter` but as a pipeline stage:
+
+```python
+from slonk import Slonk, filter
+
+pipeline = (
+    Slonk()
+    | "./access.log"
+    | filter(lambda line: "POST" in line)        # keep POST requests
+    | filter(lambda line: "/api/" in line)        # further narrow to API calls
+    | "./post_api_requests.log"
+)
+pipeline.run()
+```
+
+## Map: transform items individually
+
+Use `map()` to apply a function to each item.  Unlike a transform
+callable (which receives the whole iterable), `map` operates per-item:
+
+```python
+from slonk import Slonk, map
+import json
+
+pipeline = (
+    Slonk()
+    | "./events.jsonl"
+    | map(json.loads)                            # parse each line as JSON
+    | map(lambda obj: f"{obj['ts']}\t{obj['msg']}")
+    | "./events.tsv"
+)
+pipeline.run()
+```
+
+## Flatten: unpack nested iterables
+
+Use `flatten()` to expand one level of nesting.  Strings and bytes are
+treated as atoms (not iterated into characters):
+
+```python
+from slonk import Slonk, flatten
+
+def fetch_pages():
+    """Each API call returns a list of results."""
+    return [
+        ["user_1", "user_2"],
+        ["user_3"],
+        ["user_4", "user_5", "user_6"],
+    ]
+
+pipeline = (
+    Slonk()
+    | fetch_pages
+    | flatten()              # ['user_1', 'user_2', 'user_3', ...]
+    | "./all_users.txt"
+)
+pipeline.run()
+```
+
+## Head and tail: slice a stream
+
+Use `head(n)` and `tail(n)` to take the first or last *n* items:
+
+```python
+from slonk import Slonk, head, tail
+
+# Most recent 50 errors
+pipeline = (
+    Slonk()
+    | "./application.log"
+    | "grep ERROR"
+    | tail(50)
+    | "./recent_errors.txt"
+)
+pipeline.run()
+
+# Preview the first 10 lines of a large file
+pipeline = (
+    Slonk()
+    | "s3://datalake/huge_dataset.csv"
+    | head(10)
+)
+preview = list(pipeline.run())
+```
+
+## Skip: discard leading items
+
+Use `skip(n)` to drop the first *n* items -- handy for skipping
+headers in CSV files:
+
+```python
+from slonk import Slonk, skip
+
+pipeline = (
+    Slonk()
+    | "./data.csv"
+    | skip(1)                    # drop the header row
+    | (lambda rows: [parse_csv_row(r) for r in rows])
+    | "./parsed.csv"
+)
+pipeline.run()
+```
+
+## Batch: group items for bulk operations
+
+Use `batch(size)` to collect items into fixed-size lists before
+passing them downstream.  The final batch may be smaller:
+
+```python
+from slonk import Slonk, batch, flatten
+
+def bulk_geocode(addresses):
+    """Call geocoding API with a batch of addresses."""
+    return [geocode_api(a) for a in addresses]
+
+pipeline = (
+    Slonk()
+    | "./addresses.txt"
+    | batch(50)                           # groups of 50 addresses
+    | (lambda batches: [bulk_geocode(b) for b in batches])
+    | flatten()                           # unpack batch results
+    | "./geocoded.txt"
+)
+pipeline.run()
+```
+
+## Filter + map + batch: end-to-end ETL
+
+Combining the new combinators for a complete pipeline:
+
+```python
+from slonk import Slonk, filter, map, batch, tee
+import json
+
+archive = Slonk() | "s3://archive/processed.jsonl"
+
+pipeline = (
+    Slonk()
+    | "./raw_events.jsonl"
+    | map(json.loads)                                    # parse JSON
+    | filter(lambda e: e.get("level") == "error")        # errors only
+    | map(lambda e: json.dumps(e, sort_keys=True))       # re-serialise
+    | tee(archive)                                       # archive to S3
+    | batch(100)                                         # group for bulk insert
+    | (lambda batches: [store_batch(b) for b in batches])
+)
+pipeline.run()
+```
+
 ## Database to file export
 
 Export database contents to a local or remote file:

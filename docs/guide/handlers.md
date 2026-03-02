@@ -29,12 +29,19 @@ pipeline = Slonk() | "s3://bucket/data.csv"
 
 ### ShellCommandHandler
 
-Pipes data through a shell command via `stdin`/`stdout`.
+Runs a shell command, piping data through `stdin`/`stdout`.
 
+- **Source**: runs the command with no stdin, yielding stdout lines.
+  Useful for commands that generate output on their own (e.g. `echo`,
+  `seq`, `find`, `ls`).
 - **Transform**: feeds input to stdin via a writer thread, yields stdout
   lines as they arrive.
 
 ```python
+# Source: run a command that generates output
+pipeline = Slonk() | "seq 10"
+
+# Transform: pipe data through sort and grep
 pipeline = (
     Slonk()
     | (lambda: ["banana", "apple", "cherry"])
@@ -157,6 +164,186 @@ result = list(pipeline.run())
 !!! note "Shell-inspired naming"
     `tee` (fan-out), `merge` (interleaved fan-in), and `cat`
     (ordered fan-in) mirror their Unix shell counterparts.
+
+### FilterHandler
+
+Keep only items where a predicate returns truthy.
+
+- **Transform**: evaluates the predicate per item.
+
+Use the `filter()` factory or `.filter()` method:
+
+```python
+from slonk import Slonk, filter
+
+# Factory style
+pipeline = (
+    Slonk()
+    | (lambda: ["error: disk full", "info: ok", "error: timeout"])
+    | filter(lambda line: line.startswith("error"))
+)
+result = list(pipeline.run())
+# ['error: disk full', 'error: timeout']
+
+# Method style
+pipeline = (
+    Slonk()
+    | (lambda: [1, 2, 3, 4, 5])
+).filter(lambda x: x % 2 == 0)
+# yields 2, 4
+```
+
+!!! note
+    The `filter()` factory shadows the Python builtin `filter`.
+    Import it explicitly from `slonk` when you need it.
+
+### MapHandler
+
+Apply a function to each item individually, yielding the transformed
+result.  Unlike a transform callable (which receives the whole iterable),
+`map` operates per-item.
+
+- **Transform**: calls `func(item)` for each item.
+
+Use the `map()` factory or `.map()` method:
+
+```python
+from slonk import Slonk, map
+
+pipeline = (
+    Slonk()
+    | (lambda: ["hello", "world"])
+    | map(str.upper)
+)
+result = list(pipeline.run())
+# ['HELLO', 'WORLD']
+```
+
+!!! note
+    The `map()` factory shadows the Python builtin `map`.
+    Import it explicitly from `slonk` when you need it.
+
+### FlattenHandler
+
+Flatten one level of nesting -- if an item is iterable, yield its
+elements individually.  Strings and bytes are treated as atoms (not
+expanded into characters).
+
+- **Transform**: yields sub-elements of iterable items.
+
+Use the `flatten()` factory or `.flatten()` method:
+
+```python
+from slonk import Slonk, flatten
+
+pipeline = (
+    Slonk()
+    | (lambda: [["a", "b"], ["c", "d"], "e"])
+    | flatten()
+)
+result = list(pipeline.run())
+# ['a', 'b', 'c', 'd', 'e']
+```
+
+### HeadHandler
+
+Yield only the first *n* items, then drain the rest.  The drain
+ensures upstream queues are not blocked in parallel mode.
+
+- **Transform**: yields at most *n* items.
+
+Use the `head()` factory or `.head()` method:
+
+```python
+from slonk import Slonk, head
+
+pipeline = (
+    Slonk()
+    | (lambda: range(1000))
+    | head(5)
+)
+result = list(pipeline.run())
+# [0, 1, 2, 3, 4]
+```
+
+### SkipHandler
+
+Skip the first *n* items and yield the rest.
+
+- **Transform**: discards *n* leading items.
+
+Use the `skip()` factory or `.skip()` method:
+
+```python
+from slonk import Slonk, skip
+
+# Skip a CSV header row
+pipeline = (
+    Slonk()
+    | "./data.csv"
+    | skip(1)
+    | (lambda rows: [process(r) for r in rows])
+)
+```
+
+### TailHandler
+
+Yield only the last *n* items.  The entire input must be consumed
+before any output is produced (uses a bounded `deque` internally so
+memory stays at O(n)).
+
+- **Transform**: yields the last *n* items.
+
+Use the `tail()` factory or `.tail()` method:
+
+```python
+from slonk import Slonk, tail
+
+pipeline = (
+    Slonk()
+    | (lambda: ["first", "second", "third", "fourth"])
+    | tail(2)
+)
+result = list(pipeline.run())
+# ['third', 'fourth']
+```
+
+### BatchHandler
+
+Group items into fixed-size batches (lists).  Downstream stages
+receive `list` items instead of individual items.  The final batch
+may be smaller if the total count is not evenly divisible.
+
+- **Transform**: yields lists of up to *size* items.
+
+Use the `batch()` factory or `.batch()` method:
+
+```python
+from slonk import Slonk, batch
+
+pipeline = (
+    Slonk()
+    | (lambda: range(7))
+    | batch(3)
+)
+result = list(pipeline.run())
+# [[0, 1, 2], [3, 4, 5], [6]]
+```
+
+Batching is useful for grouping items before bulk operations:
+
+```python
+from slonk import Slonk, batch, flatten
+
+pipeline = (
+    Slonk()
+    | "./large_input.txt"
+    | batch(100)
+    | (lambda batches: [bulk_api_call(b) for b in batches])
+    | flatten()                  # unpack batch results
+    | "./results.txt"
+)
+```
 
 ## Callable wrappers
 

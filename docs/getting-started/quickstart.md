@@ -134,6 +134,29 @@ Use `parallel=False` for sequential execution:
 result = pipeline.run(parallel=False)
 ```
 
+## Stream combinators
+
+Slonk provides built-in combinators for common data manipulation.
+Use them as factory functions with `|`:
+
+```python
+from slonk import Slonk, filter, map, head, batch
+
+pipeline = (
+    Slonk()
+    | (lambda: ["alice", "bob", "charlie", "david", "eve"])
+    | filter(lambda name: len(name) > 3)      # drop short names
+    | map(str.upper)                           # uppercase each name
+    | head(3)                                  # take first 3
+)
+result = list(pipeline.run())
+# ['ALICE', 'CHARLIE', 'DAVID']
+```
+
+Available combinators: `filter`, `map`, `flatten`, `head`, `skip`,
+`tail`, `batch`, `tee`, `merge`, `cat`.  See [Handlers](../guide/handlers.md)
+for full documentation.
+
 ## Adding middleware
 
 Middleware lets you observe pipeline execution without modifying handlers:
@@ -156,8 +179,9 @@ print(f"Pipeline took {tm.pipeline_duration:.4f}s")
 
 - [Pipeline Concepts](../guide/concepts.md) -- understand sources,
   transforms, sinks, and roles
-- [Handlers](../guide/handlers.md) -- built-in handler types
+- [Handlers](../guide/handlers.md) -- built-in handler types and stream
+  combinators (`filter`, `map`, `flatten`, `head`, `skip`, `tail`, `batch`)
 - [Middleware](../guide/middleware.md) -- observability hooks
 - [Parallel Execution](../guide/parallel.md) -- threading, backpressure,
-  and data parallelism
+  timeout, and data parallelism
 - [Recipes](../guide/recipes.md) -- real-world data engineering patterns
