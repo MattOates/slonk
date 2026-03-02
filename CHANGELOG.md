@@ -2,6 +2,17 @@
 
 <!-- version list -->
 
+## v0.4.1 (2026-03-02)
+
+### Bug Fixes
+
+- Rename Test* SQLAlchemy helpers to Example* to suppress pytest collection warnings
+  ([`ae3ce2c`](https://github.com/MattOates/slonk/commit/ae3ce2c847b6e0439fdd0853843ec6167086f375))
+
+- Use __test__ = False instead of renaming TestBase/TestModel helpers
+  ([`9546249`](https://github.com/MattOates/slonk/commit/9546249f95b6bb101a7d5c4d480aa6def0372092))
+
+
 ## v0.4.0 (2026-03-01)
 
 ### Features
